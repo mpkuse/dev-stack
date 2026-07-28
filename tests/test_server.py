@@ -233,7 +233,11 @@ class StatusBridgeTests(unittest.TestCase):
         bridge = PorterminalOperationBridge(Path("/tmp/dev_stack"))
         self.assertEqual(
             bridge.command("restart"),
-            ["/tmp/dev_stack", "porterminal", "restart"],
+            ["/tmp/dev_stack", "porterminal", "restart", "--tailscale-serve"],
+        )
+        self.assertEqual(
+            bridge.command("start"),
+            ["/tmp/dev_stack", "porterminal", "start", "--tailscale-serve"],
         )
         self.assertEqual(
             bridge.command("clean"),
@@ -241,6 +245,8 @@ class StatusBridgeTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             bridge.command("password-reset")
+        with self.assertRaises(ValueError):
+            bridge.command("publish")
 
     def test_porterminal_operation_bridge_preserves_path_for_dashboard_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

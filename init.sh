@@ -149,6 +149,7 @@ excluded_names = {
     ".ruff_cache",
     ".venv",
     "__pycache__",
+    "node_modules",
 }
 
 paths = []
@@ -270,7 +271,7 @@ install_code_copy() {
   cp -a -- "${SOURCE_ROOT}/." "${stage_root}/dev-stack/"
 
   find "${stage_root}/dev-stack" -type d \
-    \( -name .git -o -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache -o -name .venv \) \
+    \( -name .git -o -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache -o -name .venv -o -name node_modules \) \
     -prune -exec rm -rf -- {} +
   find "${stage_root}/dev-stack" -type f -name '*.pyc' -delete
   rm -f -- "${stage_root}/dev-stack/.dev-stack-manifest"

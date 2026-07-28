@@ -4,4 +4,5 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+node_modules/
 .dev-stack-manifest

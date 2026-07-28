@@ -1,10 +1,17 @@
 # dev-stack
 
-This repository contains the `dev_stack` CLI, status frontend,
-limited-operations HTTP backend, live status collector, tests, and managed
-go2rtc configuration. The frontend has no build step. The backend uses only
-the Python standard library and delegates service truth to `dev_stack status
---json`.
+`dev-stack` is our private remote-working infrastructure for development
+machines. It connects services such as Code Server, Porterminal, File Browser,
+and go2rtc behind one management layer and makes them available securely over
+Tailscale. From another device on the tailnet, we can develop code on a machine,
+open a terminal, browse files, inspect camera streams, and monitor or manage the
+services that provide those capabilities.
+
+The `dev_stack` CLI is the control plane for service lifecycle, credentials,
+status, and Tailscale publication. Its authenticated dashboard provides a
+single view of the machine and a deliberately limited set of remote operations.
+The frontend has no build step, while the Python-standard-library backend
+delegates service truth to `dev_stack status --json`.
 
 The default local port is **1080**. The server binds to loopback and is published
 privately at `/dev-stack` with Tailscale Serve unless `--tailscale-no-serve` is
@@ -265,7 +272,7 @@ No hostname, port, or tailnet name is hard-coded in the frontend.
 | `GET`, `HEAD` | `/api/status` | Authenticated `dev_stack status --json` output |
 | `POST` | `/api/credentials/reveal` | Authenticated, explicit credential read |
 | `POST` | `/api/services/filebrowser/actions` | Authenticated Start, Stop, Restart, or Clean |
-| `POST` | `/api/services/porterminal/actions` | Authenticated Start, Stop, Restart, or Clean |
+| `POST` | `/api/services/porterminal/actions` | Authenticated Start, Stop, Restart, or Clean; Start and Restart publish automatically |
 | `POST` | `/api/services/go2rtc/actions` | Authenticated Start, Stop, Restart, Clean, Publish, or Unpublish |
 | `POST` | `/api/services/code-server/actions` | Authenticated lifecycle, saved-profile operations, path start, or global Clean |
 
@@ -381,4 +388,8 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q backend
 bash -n dev_stack
 bash -n init.sh
+
+cd frontend/e2e
+npm install
+npm test
 ```

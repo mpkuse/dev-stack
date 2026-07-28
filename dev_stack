@@ -334,7 +334,11 @@ porterminal service
 Manage a single Porterminal instance and its Tailscale exposure.
 
 Usage:
-  ${PORTERMINAL_CLI} <start|stop|status|restart|clean> [options]
+  ${PORTERMINAL_CLI} <start|stop|status|restart|clean|publish|unpublish> [options]
+
+Route controls:
+  publish                  Publish a running Porterminal through Tailscale Serve.
+  unpublish                Remove Porterminal's Tailscale Serve route without stopping it.
 
 Options:
   --port <port>            Local bind port. Default: reuses the port stored in state, or ${DEFAULT_PORTERMINAL_PORT}.
@@ -347,6 +351,7 @@ Options:
                            at http://<bind-host>:<port>.
                            Without this flag, Porterminal is published over your tailnet at
                            https://<tailnet-host>/.
+  --tailscale-serve        Publish via Tailscale Serve even if saved state previously disabled it.
   --help                   Show this help.
 
 Unsupported:
@@ -1967,7 +1972,7 @@ filebrowser_main() {
 
 porterminal_show_command_help() {
   case "$1" in
-    start|stop|status|restart|clean|"") porterminal_usage ;;
+    start|stop|status|restart|clean|publish|unpublish|"") porterminal_usage ;;
     *) porterminal_usage ;;
   esac
 }
@@ -2043,6 +2048,10 @@ parse_porterminal_args() {
         ;;
       --tailscale-no-serve)
         CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      --tailscale-serve)
+        CLI_TAILSCALE_ENABLE="true"
         shift
         ;;
       --instance-name|--workspace-dir|--password-no-save)
@@ -2414,6 +2423,79 @@ porterminal_clean() {
   fi
 }
 
+porterminal_publish() {
+  require_cmd jq
+  require_cmd ss
+  require_cmd curl
+  require_cmd tailscale
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "Cannot publish Porterminal because it is not managed." >&2
+    exit 1
+  fi
+
+  local pid
+  pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if ! process_is_alive "$pid" \
+    || ! is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT" \
+    || ! porterminal_health_ok; then
+    echo "Cannot publish Porterminal because it is not running and healthy." >&2
+    exit 1
+  fi
+
+  RESOLVED_TAILSCALE_ENABLE="true"
+  ensure_no_route_collision
+  if ! configure_tailscale_route; then
+    echo "Porterminal is running locally, but Tailscale Serve configuration failed." >&2
+    exit 1
+  fi
+  if ! recorded_target_matches \
+    "$RESOLVED_TAILSCALE_PATH" \
+    "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    echo "The Porterminal Tailscale Serve route was not observed after publication." >&2
+    exit 1
+  fi
+
+  state_update_field "$RESOLVED_INSTANCE_NAME" tailscale_enable '"true"'
+  state_update_field \
+    "$RESOLVED_INSTANCE_NAME" \
+    tailscale_url \
+    "$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')"
+  echo "Porterminal is published through Tailscale Serve."
+  porterminal_reconcile_status
+}
+
+porterminal_unpublish() {
+  require_cmd jq
+  require_cmd tailscale
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "Cannot unpublish Porterminal because it is not managed." >&2
+    exit 1
+  fi
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    if ! recorded_target_matches \
+      "$RESOLVED_TAILSCALE_PATH" \
+      "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+      echo "Refusing to remove Tailscale route ${RESOLVED_TAILSCALE_PATH}: backend does not match Porterminal." >&2
+      exit 1
+    fi
+    if ! remove_tailscale_route; then
+      echo "The Porterminal Tailscale Serve route could not be removed safely." >&2
+      exit 1
+    fi
+  fi
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    echo "The Porterminal Tailscale Serve route is still present." >&2
+    exit 1
+  fi
+
+  RESOLVED_TAILSCALE_ENABLE="false"
+  state_update_field "$RESOLVED_INSTANCE_NAME" tailscale_enable '"false"'
+  state_update_field "$RESOLVED_INSTANCE_NAME" tailscale_url "null"
+  echo "Porterminal is no longer published through Tailscale Serve."
+  porterminal_reconcile_status
+}
+
 porterminal_main() {
   parse_porterminal_args "$@"
   ensure_state
@@ -2437,6 +2519,12 @@ porterminal_main() {
       ;;
     clean)
       porterminal_clean
+      ;;
+    publish)
+      porterminal_publish
+      ;;
+    unpublish)
+      porterminal_unpublish
       ;;
     *)
       echo "Unknown command: $COMMAND" >&2
@@ -3305,7 +3393,8 @@ API boundary:
   Status polling may execute only '${SCRIPT_NAME} status --json'.
   Credential reveal may execute only the fixed '${SCRIPT_NAME} credentials show ... --json' allowlist.
   File Browser controls may execute only '${SCRIPT_NAME} filebrowser start|stop|restart|clean'.
-  Porterminal controls may execute only '${SCRIPT_NAME} porterminal start|stop|restart|clean'.
+  Porterminal controls may execute only '${SCRIPT_NAME} porterminal start|stop|restart|clean';
+  dashboard Start and Restart force Tailscale publication.
   go2rtc controls may execute only '${SCRIPT_NAME} go2rtc start|stop|restart|clean'.
   Code Server controls may execute only per-instance '${SCRIPT_NAME} code-server start|stop|restart --instance-name <name>' and global '${SCRIPT_NAME} code-server clean'.
   No other state-changing dev_stack service commands are exposed over HTTP.

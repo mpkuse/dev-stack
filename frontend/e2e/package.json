@@ -1,0 +1,11 @@
+{
+  "name": "dev-stack-frontend-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node card-actions.e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
+  }
+}

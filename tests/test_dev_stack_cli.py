@@ -149,8 +149,42 @@ class PorterminalPathCommandTests(unittest.TestCase):
                 encoding="utf-8",
             )
             porterminal.chmod(0o755)
+            route_state = root / "porterminal-route-state"
+            route_state.write_text("absent\n", encoding="utf-8")
             tailscale = test_bin / "tailscale"
-            tailscale.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            tailscale.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                'if [ "${1:-}" = "status" ] && [ "${2:-}" = "--json" ]; then\n'
+                "  printf '%s\\n' '{\"Self\":{\"DNSName\":\"test-host.example.ts.net.\"}}'\n"
+                "  exit 0\n"
+                "fi\n"
+                'if [ "${1:-}" = "serve" ] && [ "${2:-}" = "status" ] '
+                '&& [ "${3:-}" = "--json" ]; then\n'
+                '  if [ "$(cat "$PORTERMINAL_TEST_ROUTE_STATE")" = "present" ]; then\n'
+                "    printf '%s\\n' "
+                "'{\"Web\":{\"test-host.example.ts.net:443\":{\"Handlers\":"
+                "{\"/\":{\"Proxy\":\"http://127.0.0.1:"
+                + str(port)
+                + "\"}}}}}'\n"
+                "  else\n"
+                "    printf '%s\\n' "
+                "'{\"Web\":{\"test-host.example.ts.net:443\":{\"Handlers\":{}}}}'\n"
+                "  fi\n"
+                "  exit 0\n"
+                "fi\n"
+                f'if [ "$*" = "serve --bg --https=443 --set-path / '
+                f'http://127.0.0.1:{port}" ]; then\n'
+                '  printf "%s\\n" present > "$PORTERMINAL_TEST_ROUTE_STATE"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$*" = "serve --https=443 --set-path / off" ]; then\n'
+                '  printf "%s\\n" absent > "$PORTERMINAL_TEST_ROUTE_STATE"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
             tailscale.chmod(0o755)
 
             dev_stack_home = root / "dev-stack-home"
@@ -163,6 +197,7 @@ class PorterminalPathCommandTests(unittest.TestCase):
                 "DEV_STACK_STATE_ROOT": str(state_root),
                 "DEV_STACK_LOG_ROOT": str(log_root),
                 "PORTERMINAL_TEST_CAPTURE": str(capture_path),
+                "PORTERMINAL_TEST_ROUTE_STATE": str(route_state),
             }
             started = subprocess.run(
                 [
@@ -201,6 +236,74 @@ class PorterminalPathCommandTests(unittest.TestCase):
                         str(dev_stack_home / "data" / "porterminal-snippets.json"),
                         "--password-stdin",
                     ],
+                )
+
+                published = subprocess.run(
+                    [str(DEV_STACK), "porterminal", "publish"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=environment,
+                )
+                self.assertEqual(published.returncode, 0, published.stderr)
+                self.assertEqual(route_state.read_text(encoding="utf-8").strip(), "present")
+                state = json.loads(
+                    (state_root / "state-porterminal.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    state["instances"]["porterminal"]["tailscale_enable"],
+                    "true",
+                )
+                self.assertEqual(
+                    state["instances"]["porterminal"]["tailscale_url"],
+                    "https://test-host.example.ts.net/",
+                )
+
+                unpublished = subprocess.run(
+                    [str(DEV_STACK), "porterminal", "unpublish"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=environment,
+                )
+                self.assertEqual(unpublished.returncode, 0, unpublished.stderr)
+                self.assertEqual(route_state.read_text(encoding="utf-8").strip(), "absent")
+                state = json.loads(
+                    (state_root / "state-porterminal.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    state["instances"]["porterminal"]["tailscale_enable"],
+                    "false",
+                )
+                self.assertIsNone(state["instances"]["porterminal"]["tailscale_url"])
+
+                restarted = subprocess.run(
+                    [
+                        str(DEV_STACK),
+                        "porterminal",
+                        "restart",
+                        "--tailscale-serve",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=environment,
+                )
+                self.assertEqual(restarted.returncode, 0, restarted.stderr)
+                self.assertEqual(route_state.read_text(encoding="utf-8").strip(), "present")
+                state = json.loads(
+                    (state_root / "state-porterminal.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    state["instances"]["porterminal"]["tailscale_enable"],
+                    "true",
+                )
+                self.assertEqual(
+                    state["instances"]["porterminal"]["tailscale_url"],
+                    "https://test-host.example.ts.net/",
                 )
             finally:
                 if (state_root / "state-porterminal.json").exists():

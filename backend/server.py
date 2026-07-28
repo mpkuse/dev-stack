@@ -177,7 +177,10 @@ class PorterminalOperationBridge:
     def command(self, action: str) -> list[str]:
         if action not in self.ACTIONS:
             raise ValueError("unsupported porterminal action")
-        return [str(self.dev_stack_path), "porterminal", action]
+        command = [str(self.dev_stack_path), "porterminal", action]
+        if action in {"start", "restart"}:
+            command.append("--tailscale-serve")
+        return command
 
     def run(self, action: str) -> dict[str, str]:
         command = self.command(action)
