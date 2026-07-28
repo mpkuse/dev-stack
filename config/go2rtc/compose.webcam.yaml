@@ -1,0 +1,5 @@
+services:
+  go2rtc:
+    devices:
+      - ${GO2RTC_VIDEO_DEVICE:?dev_stack must supply the host video device}:/dev/video-brio
+      - ${GO2RTC_SOUND_DEVICE:?dev_stack must supply the host sound device}:/dev/snd

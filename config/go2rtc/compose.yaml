@@ -1,0 +1,19 @@
+name: go2rtc-local
+
+services:
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: go2rtc
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Zurich
+    env_file:
+      - ${GO2RTC_STREAM_ENV_FILE:?dev_stack must supply the host stream environment file}
+      - ${GO2RTC_AUTH_ENV_FILE:?dev_stack must supply the managed authentication file}
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

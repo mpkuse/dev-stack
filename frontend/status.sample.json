@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-16T09:42:18+02:00",
+  "host": {
+    "hostname": "p8s-mkuse-lenovo",
+    "display_name": "Development laptop",
+    "username": "manoharkuse",
+    "interfaces": [
+      {
+        "name": "enp129s0",
+        "type": "ethernet",
+        "physical": true,
+        "state": "down",
+        "addresses": [],
+        "configured_addresses": ["192.168.50.10/24"]
+      },
+      {
+        "name": "wlp130s0",
+        "type": "wireless",
+        "physical": true,
+        "state": "up",
+        "addresses": ["192.168.1.128"]
+      },
+      {
+        "name": "enx98a44e85b014",
+        "type": "ethernet",
+        "physical": true,
+        "state": "down",
+        "addresses": [],
+        "configured_addresses": ["192.168.50.10/24"]
+      },
+      {
+        "name": "docker0",
+        "type": "bridge",
+        "virtual": true,
+        "addresses": ["172.17.0.1"]
+      }
+    ]
+  },
+  "tailnet": {
+    "connected": true,
+    "dns_name": "p8s-mkuse-lenovo.tail62fc06.ts.net",
+    "ipv4": "100.64.0.11",
+    "dashboard_url": "https://p8s-mkuse-lenovo.tail62fc06.ts.net/dev-stack/?demo=1"
+  },
+  "services": [
+    {
+      "id": "code-server",
+      "name": "Code Server",
+      "description": "Browser-based development workspaces",
+      "status": "running",
+      "summary": "Two workspaces are available through the tailnet.",
+      "health": {
+        "state": "healthy",
+        "message": "2 running · 1 stopped"
+      },
+      "instances": [
+        {
+          "name": "bin",
+          "status": "running",
+          "workspace": "/home/manoharkuse/.bin",
+          "port": 9341,
+          "uptime_seconds": 12240,
+          "url": "https://p8s-mkuse-lenovo.demo-tailnet.ts.net/code-server-manager/bin/"
+        },
+        {
+          "name": "object-transfer-calibration-and-perception-workspace",
+          "status": "running",
+          "workspace": "/home/manoharkuse/workspace/object-transfer/calibration-and-perception",
+          "port": 9342,
+          "uptime_seconds": 3180,
+          "url": "https://p8s-mkuse-lenovo.demo-tailnet.ts.net/code-server-manager/object-transfer-calibration-and-perception-workspace/"
+        },
+        {
+          "name": "experiments",
+          "status": "stopped",
+          "workspace": "/home/manoharkuse/workspace/experiments",
+          "port": 9343,
+          "uptime_seconds": null,
+          "url": null
+        }
+      ]
+    },
+    {
+      "id": "filebrowser",
+      "name": "File Browser",
+      "description": "Private file access for this machine",
+      "status": "stopped",
+      "summary": "The service is configured but not currently running.",
+      "bind_host": "127.0.0.1",
+      "port": 9900,
+      "uptime_seconds": null,
+      "url": null,
+      "route": {
+        "enabled": true,
+        "present": false,
+        "path": "/filebrowser"
+      },
+      "health": {
+        "state": "not_checked",
+        "message": "No process or listener detected"
+      }
+    },
+    {
+      "id": "porterminal",
+      "name": "Porterminal",
+      "description": "Persistent terminal sessions in the browser",
+      "status": "drifted",
+      "summary": "The local process is healthy, but its Serve route needs attention.",
+      "bind_host": "127.0.0.1",
+      "port": 9444,
+      "uptime_seconds": 8460,
+      "url": "https://p8s-mkuse-lenovo.demo-tailnet.ts.net/",
+      "route": {
+        "enabled": true,
+        "present": false,
+        "path": "/"
+      },
+      "health": {
+        "state": "degraded",
+        "message": "Local health passed · Tailscale route missing"
+      }
+    },
+    {
+      "id": "go2rtc",
+      "name": "go2rtc",
+      "description": "Local camera and RTSP/WebRTC gateway",
+      "status": "running",
+      "summary": "The go2rtc container and local WebUI/API are healthy.",
+      "bind_host": "127.0.0.1",
+      "port": 1984,
+      "uptime_seconds": 2280,
+      "url": "https://p8s-mkuse-lenovo.demo-tailnet.ts.net/go2rtc/",
+      "route": {
+        "enabled": true,
+        "present": true,
+        "path": "/go2rtc"
+      },
+      "credential": {
+        "available": true,
+        "username": "admin"
+      },
+      "health": {
+        "state": "healthy",
+        "message": "Container state and local HTTP health check agree."
+      }
+    }
+  ]
+}

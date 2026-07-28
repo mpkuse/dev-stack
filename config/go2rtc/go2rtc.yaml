@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/AlexxIT/go2rtc/master/www/schema.json
+
+app:
+  modules: [api, ws, rtsp, webrtc, exec, ffmpeg, mp4, hls, mjpeg]
+
+api:
+  # Keep the powerful WebUI/API local to this host.
+  listen: "127.0.0.1:1984"
+  # Tailscale Serve reaches this listener through localhost, so local_auth must
+  # stay enabled or proxy requests would bypass Basic authentication.
+  username: "${GO2RTC_API_USERNAME}"
+  password: "${GO2RTC_API_PASSWORD}"
+  local_auth: true
+
+rtsp:
+  # Keep republished RTSP streams local to this host.
+  listen: "127.0.0.1:8554"
+
+webrtc:
+  # WebRTC media is encrypted and needs both TCP and UDP reachability.
+  listen: ":8555"
+
+exec:
+  allow_paths: [ffmpeg]
+
+streams:
+  brio:
+    # FFmpeg starts on demand. The Brio provides MJPEG; go2rtc converts it to
+    # browser-compatible H.264 at a moderate CPU-friendly resolution.
+    - "ffmpeg:device?video=/dev/video-brio&input_format=mjpeg&video_size=1280x720&framerate=30#video=h264"
+    # Add the Brio microphone as a second track.
+    - "ffmpeg:device?audio=hw:BRIO,0&channels=2&sample_rate=48000#audio=opus"
+
+  # Preserve the original 4K HEVC stream for clients that support it.
+  reolink_main_4k_hevc: "${REOLINK_MAIN_RTSP_URL}"
+  # Chrome accepts this camera's HEVC track but renders a black MSE frame.
+  # Transcode on demand to H.264 at 1080p for reliable browser playback.
+  reolink_main: "ffmpeg:${REOLINK_MAIN_RTSP_URL}#video=h264#width=1920#audio=copy"
+  reolink_sub: "${REOLINK_SUB_RTSP_URL}"
+
+log:
+  level: info
+  format: text

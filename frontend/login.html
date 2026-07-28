@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="color-scheme" content="light">
+    <title>Sign in · Dev Stack</title>
+    <link rel="stylesheet" href="./login.css">
+    <script src="./login.js" defer></script>
+  </head>
+  <body>
+    <main class="login-shell">
+      <section class="login-card" aria-labelledby="login-title">
+        <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+        <p class="eyebrow">Private dashboard</p>
+        <h1 id="login-title">Sign in to dev_stack</h1>
+        <p class="intro">Enter the dashboard master password to continue.</p>
+
+        <form id="login-form">
+          <label for="master-password">Master password</label>
+          <input
+            id="master-password"
+            name="password"
+            type="password"
+            required
+            autofocus
+            maxlength="1024"
+            autocomplete="current-password"
+          >
+          <p class="form-message" id="form-message" role="alert" aria-live="polite"></p>
+          <button id="login-button" type="submit">Sign in</button>
+        </form>
+
+        <p class="footnote">Protected on localhost and across the tailnet.</p>
+      </section>
+    </main>
+  </body>
+</html>

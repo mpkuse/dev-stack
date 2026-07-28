@@ -1,0 +1,4179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# dev_stack
+#
+# Manage local developer-stack services. Each service has its own subcommand surface.
+#
+# Usage:
+#   dev_stack <service> <command> [options]
+#   dev_stack status
+#   dev_stack admin password reset
+#   dev_stack credentials show --service <service> [--instance-name <name>] --json
+#   dev_stack clean
+#
+# Supported services:
+#   code-server   Manage the system-installed code-server and its Tailscale exposure.
+#   filebrowser   Manage a single File Browser instance and its Tailscale exposure.
+#   porterminal   Manage a single Porterminal instance and its Tailscale exposure.
+#   go2rtc        Manage the local go2rtc Docker Compose deployment.
+#   www           Serve the dev_stack status and limited-operations dashboard locally and over Tailscale.
+#
+# Run `dev_stack <service> help` for service-specific commands and options.
+# Run `dev_stack status` to show every supported service status.
+# Run `dev_stack clean` to clean stopped state for every supported service.
+
+# code-server service
+#
+# Manage the system-installed code-server and its Tailscale exposure for named instances.
+# This service is tested with code-server 4.115.0.
+#
+# Usage:
+#   dev_stack code-server <start|stop|status|restart|clean> [options]
+#   dev_stack code-server profile <save|list|start|delete> [profile-name] [--json]
+#
+# Options:
+#   --instance-name <name>    Optional for start; auto-generates a friendly random name if omitted. Required for stop/restart.
+#   --workspace-dir <path>    Workspace directory to open in code-server. Defaults to current working directory for start.
+#   --port <port>             Bind port. Reuses state if omitted, otherwise auto-allocates.
+#   --bind-host <host>        Bind host. Default: 127.0.0.1
+#   --tailscale-no-serve      Skip Tailscale Serve for this instance.
+#   --password-no-save        Don't persist the generated password in state (start only).
+#   --help                    Show this help.
+#
+# State:
+#   An initialized installation stores state in <prefix>/.dev-stack/state.
+#   The state file stores known instances and last resolved runtime details.
+#
+# Tailscale model:
+#   This service only manages routes under /code-server-manager/<instance-name>.
+#   It refuses to touch routes outside that namespace.
+#
+# Development notes:
+#   - Precedence is CLI > state > built-in defaults.
+#   - `status` without --instance-name shows all managed instances.
+#   - `status --instance-name <name>` reconciles one recorded instance.
+#   - `stop` and `restart` require --instance-name.
+#   - Ports are stable once assigned in state unless explicitly overridden.
+#   - `clean` removes stopped instances from the state registry.
+#   - Saved profiles contain only an instance name and absolute workspace path.
+#   - `clean` never removes saved profiles.
+#   - Tailscale route ownership is scoped to /code-server-manager/* only.
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+INSTALL_PREFIX=""
+DEFAULT_DEV_STACK_HOME=""
+if [[ "$(basename -- "$(dirname -- "$SCRIPT_DIR")")" == "src" ]]; then
+  INSTALL_PREFIX="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+  DEFAULT_DEV_STACK_HOME="${INSTALL_PREFIX}/.dev-stack"
+fi
+if [[ -n "${DEV_STACK_HOME:-}" ]]; then
+  DEV_STACK_HOME="$(mkdir -p -- "$DEV_STACK_HOME" && cd -- "$DEV_STACK_HOME" && pwd -P)"
+elif [[ -n "$DEFAULT_DEV_STACK_HOME" && -d "$DEFAULT_DEV_STACK_HOME" ]]; then
+  DEV_STACK_HOME="$DEFAULT_DEV_STACK_HOME"
+else
+  DEV_STACK_HOME=""
+fi
+if [[ -n "$DEV_STACK_HOME" ]]; then
+  CONFIG_ROOT="${DEV_STACK_CONFIG_ROOT:-${DEV_STACK_HOME}/config}"
+  STATE_ROOT="${DEV_STACK_STATE_ROOT:-${DEV_STACK_HOME}/state}"
+  DATA_ROOT="${DEV_STACK_DATA_ROOT:-${DEV_STACK_HOME}/data}"
+  SECRETS_ROOT="${DEV_STACK_SECRETS_ROOT:-${DEV_STACK_HOME}/secrets}"
+  LOG_ROOT="${DEV_STACK_LOG_ROOT:-${DEV_STACK_HOME}/logs}"
+  SETTINGS_FILE="${DEV_STACK_SETTINGS_FILE:-${CONFIG_ROOT}/settings.json}"
+else
+  CONFIG_ROOT="${DEV_STACK_CONFIG_ROOT:-${HOME}/.config/dev-stack}"
+  STATE_ROOT="${DEV_STACK_STATE_ROOT:-${HOME}/.bin/state/dev-stack}"
+  DATA_ROOT="${DEV_STACK_DATA_ROOT:-${STATE_ROOT}}"
+  SECRETS_ROOT="${DEV_STACK_SECRETS_ROOT:-${STATE_ROOT}}"
+  LOG_ROOT="${DEV_STACK_LOG_ROOT:-/tmp}"
+  SETTINGS_FILE="${DEV_STACK_SETTINGS_FILE:-}"
+fi
+SERVICE=""
+CODE_SERVER_CLI="${SCRIPT_NAME} code-server"
+FILEBROWSER_CLI="${SCRIPT_NAME} filebrowser"
+PORTERMINAL_CLI="${SCRIPT_NAME} porterminal"
+GO2RTC_CLI="${SCRIPT_NAME} go2rtc"
+WWW_CLI="${SCRIPT_NAME} www"
+CREDENTIALS_CLI="${SCRIPT_NAME} credentials"
+ADMIN_CLI="${SCRIPT_NAME} admin"
+STATE_DIR=""
+STATE_FILE=""
+CODE_SERVER_ENABLED="true"
+FILEBROWSER_ENABLED="true"
+PORTERMINAL_ENABLED="true"
+GO2RTC_ENABLED="true"
+WWW_ENABLED="true"
+RANDOM_ADJECTIVES=("bright" "calm" "cheerful" "curious" "eager" "kind" "lively" "steady" "sunny" "upbeat")
+RANDOM_SURNAMES=("turing" "hopper" "lovelace" "shannon" "dijkstra" "babbage" "morse" "cerf" "lamport" "knuth")
+DEFAULT_BIND_HOST="127.0.0.1"
+DEFAULT_TAILSCALE_ENABLE="true"
+DEFAULT_LOG_DIR="$LOG_ROOT"
+TAILSCALE_NAMESPACE="/code-server-manager"
+FILEBROWSER_INSTANCE_NAME="filebrowser"
+FILEBROWSER_TAILSCALE_PATH="/filebrowser"
+DEFAULT_FILEBROWSER_PORT="9900"
+PORTERMINAL_INSTANCE_NAME="porterminal"
+PORTERMINAL_TAILSCALE_PATH="/"
+DEFAULT_PORTERMINAL_PORT="9444"
+PORTERMINAL_COMMAND="${DEV_STACK_PORTERMINAL_COMMAND:-porterminal}"
+PORTERMINAL_CONFIG_PATH="${CONFIG_ROOT}/porterminal.yaml"
+GO2RTC_DIR="${DEV_STACK_GO2RTC_DIR:-${SCRIPT_DIR}/config/go2rtc}"
+GO2RTC_COMPOSE_FILE="${GO2RTC_DIR}/compose.yaml"
+GO2RTC_WEBCAM_COMPOSE_FILE="${GO2RTC_DIR}/compose.webcam.yaml"
+GO2RTC_CONFIG_FILE="${GO2RTC_DIR}/go2rtc.yaml"
+GO2RTC_ENV_FILE_OVERRIDE="${DEV_STACK_GO2RTC_ENV_FILE:-}"
+GO2RTC_BRIO_DEVICE_OVERRIDE="${DEV_STACK_GO2RTC_BRIO_DEVICE:-}"
+GO2RTC_SOUND_DEVICE_OVERRIDE="${DEV_STACK_GO2RTC_SOUND_DEVICE:-}"
+GO2RTC_ENV_FILE="${GO2RTC_ENV_FILE_OVERRIDE:-${HOME}/workspace/iap_rosws/.env}"
+GO2RTC_BRIO_DEVICE="${GO2RTC_BRIO_DEVICE_OVERRIDE:-/dev/v4l/by-id/usb-046d_Logitech_BRIO_67EAF98D-video-index0}"
+GO2RTC_SOUND_DEVICE="${GO2RTC_SOUND_DEVICE_OVERRIDE:-/dev/snd}"
+GO2RTC_AUTH_ENV_FILE="${DEV_STACK_GO2RTC_AUTH_ENV_FILE:-${SECRETS_ROOT}/go2rtc-auth.env}"
+GO2RTC_AUTH_USERNAME="admin"
+GO2RTC_SERVICE_NAME="go2rtc"
+GO2RTC_INSTANCE_NAME="go2rtc"
+GO2RTC_BIND_HOST="127.0.0.1"
+GO2RTC_API_PORT="1984"
+GO2RTC_TAILSCALE_PATH="/go2rtc"
+GO2RTC_JSON_MODE="false"
+GO2RTC_LOG_FOLLOW="false"
+GO2RTC_LOG_TAIL=""
+GO2RTC_OBSERVED_STATUS="unknown"
+GO2RTC_OBSERVED_SUMMARY=""
+GO2RTC_OBSERVED_HEALTH_MESSAGE=""
+GO2RTC_OBSERVED_CONTAINER_ID=""
+GO2RTC_OBSERVED_CONTAINER_STATE=""
+GO2RTC_OBSERVED_UPTIME_SECONDS=""
+GO2RTC_OBSERVED_ROUTE_PRESENT="false"
+GO2RTC_OBSERVED_ROUTE_MATCHES="false"
+GO2RTC_OBSERVED_URL=""
+GO2RTC_OBSERVED_LOCAL_HEALTH="false"
+GO2RTC_OBSERVED_AUTH_CONFIGURED="false"
+GO2RTC_CREDENTIAL_CREATED="false"
+WWW_INSTANCE_NAME="www"
+WWW_TAILSCALE_PATH="/dev-stack"
+DEFAULT_WWW_PORT="1080"
+ADMIN_STATE_FILE="${STATE_ROOT}/state-admin.json"
+ADMIN_AUTH_PATH="${SCRIPT_DIR}/backend/admin_auth.py"
+STATUS_SNAPSHOT_PATH="${SCRIPT_DIR}/backend/status_snapshot.py"
+WWW_SERVER_PATH="${SCRIPT_DIR}/backend/server.py"
+WWW_STATIC_DIR="${SCRIPT_DIR}/frontend"
+COMMAND=""
+CLI_INSTANCE_NAME=""
+CLI_WORKSPACE_DIR=""
+CLI_PORT=""
+CLI_BIND_HOST=""
+CLI_TAILSCALE_ENABLE=""
+INSTANCE_IN_STATE="false"
+EXPLICIT_INSTANCE_REQUEST="false"
+STOP_ALL="false"
+CLI_PASSWORD_NO_SAVE="false"
+RESOLVED_DB_PATH=""
+CLI_SNIPPETS_PATH=""
+CLI_PASSWORD=""
+RESOLVED_SNIPPETS_PATH=""
+RESOLVED_RUNNER_PATH=""
+RESOLVED_CONFIG_PATH=""
+
+setup_colors() {
+  if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m'
+  else
+    C_RESET=""
+    C_BOLD=""
+    C_DIM=""
+    C_RED=""
+    C_GREEN=""
+    C_YELLOW=""
+    C_BLUE=""
+    C_CYAN=""
+  fi
+}
+
+status_color() {
+  case "$1" in
+    running) printf '%s' "$C_GREEN" ;;
+    stopped|not_found) printf '%s' "$C_DIM" ;;
+    drifted|unknown) printf '%s' "$C_YELLOW" ;;
+    *) printf '%s' "$C_BLUE" ;;
+  esac
+}
+
+status_dot() {
+  local color
+  color="$(status_color "$1")"
+  printf '%s●%s' "$color" "$C_RESET"
+}
+
+format_yes_no() {
+  if [[ "$1" == "yes" || "$1" == "true" ]]; then
+    printf '%son%s' "$C_GREEN" "$C_RESET"
+  else
+    printf '%soff%s' "$C_DIM" "$C_RESET"
+  fi
+}
+
+format_started_at() {
+  local iso="$1"
+  if [[ -z "$iso" ]]; then
+    return
+  fi
+  date -d "$iso" "+%d-%m-%y %H:%M:%S %Z" 2>/dev/null
+}
+
+usage() {
+  sed -n '/^# dev_stack$/,/^# code-server service$/p' "$0" \
+    | sed '$d' \
+    | sed 's/^# \{0,1\}//'
+}
+
+code_server_usage() {
+  sed -n '/^# code-server service$/,/^SCRIPT_NAME=/p' "$0" \
+    | sed '$d' \
+    | sed 's/^# \{0,1\}//'
+}
+
+code_server_profile_usage() {
+  cat <<EOF
+code-server saved profiles
+
+Save the name and workspace path of a running instance so it can be started again later.
+
+Usage:
+  ${CODE_SERVER_CLI} profile save <running-instance>
+  ${CODE_SERVER_CLI} profile list [--json]
+  ${CODE_SERVER_CLI} profile start <profile-name>
+  ${CODE_SERVER_CLI} profile delete <profile-name>
+
+Profiles store only the instance name and canonical absolute workspace path. Runtime
+details such as passwords, ports, processes, and Tailscale routes are not copied.
+Deleting a profile never stops its running instance, and code-server clean never
+removes saved profiles.
+EOF
+}
+
+filebrowser_usage() {
+  cat <<EOF
+filebrowser service
+
+Manage a single File Browser instance and its Tailscale exposure.
+
+Usage:
+  ${FILEBROWSER_CLI} <start|stop|status|restart|clean> [options]
+  ${FILEBROWSER_CLI} password reset
+
+Options:
+  --port <port>            Local bind port. Default: reuses the port stored in state, or ${DEFAULT_FILEBROWSER_PORT}.
+  --bind-host <host>       Local bind address. Default: ${DEFAULT_BIND_HOST}.
+  --tailscale-no-serve     Do not publish via Tailscale Serve. The instance is reachable only locally
+                           at http://<bind-host>:<port>.
+                           Without this flag, File Browser is published over your tailnet at
+                           https://<tailnet-host>${FILEBROWSER_TAILSCALE_PATH}/.
+  --help                   Show this help.
+
+Unsupported:
+  --instance-name
+  --workspace-dir
+  --password-no-save
+
+State:
+  State lives in ${STATE_FILE:-${STATE_ROOT}/state-filebrowser.json}
+  Database lives in ${DATA_ROOT}/filebrowser.db
+  Clean removes stopped runtime/configuration state but preserves the saved admin credential.
+
+Password reset:
+  Stops File Browser if needed, assigns a new random password to the admin user,
+  stores it in owner-only manager state, and restores the previous running state.
+EOF
+}
+
+credentials_usage() {
+  cat <<EOF
+credentials
+
+Read one saved managed-service credential as JSON. This command is intended for
+the protected dev_stack dashboard bridge and never appears in status JSON.
+
+Usage:
+  ${CREDENTIALS_CLI} show --service code-server --instance-name <name> --json
+  ${CREDENTIALS_CLI} show --service filebrowser --json
+  ${CREDENTIALS_CLI} show --service porterminal --json
+  ${CREDENTIALS_CLI} show --service go2rtc --json
+EOF
+}
+
+admin_usage() {
+  cat <<EOF
+admin
+
+Manage the master password that protects the entire dev_stack dashboard.
+
+Usage:
+  ${ADMIN_CLI} password reset
+  ${ADMIN_CLI} status
+
+The reset command prompts twice without echoing and stores only a salted scrypt
+verifier in ${ADMIN_STATE_FILE} with mode 0600. Passwords must contain at least
+8 characters, including at least one number and one special character.
+EOF
+}
+
+porterminal_usage() {
+  cat <<EOF
+porterminal service
+
+Manage a single Porterminal instance and its Tailscale exposure.
+
+Usage:
+  ${PORTERMINAL_CLI} <start|stop|status|restart|clean> [options]
+
+Options:
+  --port <port>            Local bind port. Default: reuses the port stored in state, or ${DEFAULT_PORTERMINAL_PORT}.
+  --bind-host <host>       Local bind address. Default: ${DEFAULT_BIND_HOST}.
+  --snippets <path>        JSON snippets file. Default: ${DATA_ROOT}/porterminal-snippets.json.
+  --password <password>    Save this password to the Porterminal config before starting.
+                           Default: generate a random password and save it in state.
+                           This may be visible in shell history and process listings while the command runs.
+  --tailscale-no-serve     Do not publish via Tailscale Serve. The instance is reachable only locally
+                           at http://<bind-host>:<port>.
+                           Without this flag, Porterminal is published over your tailnet at
+                           https://<tailnet-host>/.
+  --help                   Show this help.
+
+Unsupported:
+  --instance-name
+  --workspace-dir
+  --password-no-save
+
+State:
+  State lives in ${STATE_FILE:-${STATE_ROOT}/state-porterminal.json}
+  Config lives in ${PORTERMINAL_CONFIG_PATH}
+  Snippets default to ${DATA_ROOT}/porterminal-snippets.json
+  Executable is discovered as '${PORTERMINAL_COMMAND}' from PATH.
+  Set DEV_STACK_PORTERMINAL_COMMAND to use another command name or executable path.
+  Clean removes stopped runtime/configuration state but preserves the saved password, config, and snippets.
+EOF
+}
+
+go2rtc_usage() {
+  cat <<EOF
+go2rtc service
+
+Manage the local go2rtc Docker Compose deployment.
+
+Usage:
+  ${GO2RTC_CLI} <start|stop|status|restart|clean|publish|unpublish> [--tailscale-no-serve]
+  ${GO2RTC_CLI} password reset
+  ${GO2RTC_CLI} status --json
+  ${GO2RTC_CLI} logs [--follow] [--tail <lines>]
+
+Commands:
+  start                    Create or start the deployment with Docker Compose.
+  stop                     Stop the container without removing it.
+  status                   Show container and local WebUI/API health.
+  restart                  Restart the container, or create it when absent.
+  clean                    Remove a stopped container; refuses while it is running.
+  publish                  Publish the running WebUI through Tailscale Serve.
+  unpublish                Remove the WebUI's Tailscale Serve route.
+  logs                     Show container logs. Use --follow to keep following them.
+  password reset           Generate and install a new WebUI/API password.
+
+Options:
+  --json                   Emit the secret-free service status contract (status only).
+  -f, --follow             Follow log output (logs only).
+  --tail <lines>           Number of recent log lines to show (logs only).
+  --tailscale-no-serve     Do not publish the WebUI through Tailscale Serve.
+  --help                   Show this help.
+
+Deployment:
+  Compose: ${GO2RTC_COMPOSE_FILE}
+  Config:  ${GO2RTC_CONFIG_FILE}
+  WebUI:   http://${GO2RTC_BIND_HOST}:${GO2RTC_API_PORT}/ (local host only)
+  Route:   ${GO2RTC_TAILSCALE_PATH} (enabled by default)
+
+Docker Compose remains the runtime source of truth. dev_stack state records only
+the desired Tailscale publication setting and generated WebUI/API credential.
+Clean preserves the Compose files, go2rtc configuration, image, environment
+file, and saved credential.
+EOF
+}
+
+usage_start() {
+  cat <<EOF
+start
+
+Start a code-server instance and, by default, publish it on your tailnet via Tailscale Serve.
+
+Usage:
+  ${CODE_SERVER_CLI} start [--workspace-dir <path>] [--instance-name <name>] [--port <port>]
+                           [--bind-host <host>] [--tailscale-no-serve] [--password-no-save]
+
+Options:
+  --workspace-dir <path>   Directory to open in code-server. Default: current working directory.
+  --instance-name <name>   Friendly name for this instance. Default: auto-generated (e.g. bright-turing).
+                           Reusing an existing name picks up its stored settings (port, bind host, etc.).
+  --port <port>            Local bind port. Default: reuses the port stored in state, or picks the
+                           first free port in 9000-9999. Once assigned, the port is sticky.
+  --bind-host <host>       Local bind address. Default: ${DEFAULT_BIND_HOST}.
+  --tailscale-no-serve     Do not publish via Tailscale Serve. The instance is reachable only locally
+                           at http://<bind-host>:<port>.
+                           Without this flag, code-server is published over your tailnet at
+                           https://<tailnet-host>${TAILSCALE_NAMESPACE}/<instance-name>/.
+  --password-no-save       Don't persist the generated password to state. By default the password is
+                           stored in plaintext in ${STATE_FILE} so it can be recovered later via
+                           'status' (e.g. logging in from another device). With this flag, the
+                           password is shown only in the start output — copy it then or restart the
+                           instance to get a new one.
+
+Notes:
+  - Log file: ${DEFAULT_LOG_DIR}/code-server-<instance-name>.log
+  - At most 5 instances may run concurrently.
+
+Examples:
+  ${CODE_SERVER_CLI} start                                                # current dir, random name, on tailnet
+  ${CODE_SERVER_CLI} start --instance-name bin --workspace-dir ~/.bin
+  ${CODE_SERVER_CLI} start --instance-name work --workspace-dir ~/workspace
+  ${CODE_SERVER_CLI} start --instance-name local --tailscale-no-serve     # local-only, no tailnet exposure
+EOF
+}
+
+usage_stop() {
+  cat <<EOF
+stop
+
+Stop a named managed instance, or interactively stop every managed instance.
+The instance entry remains in state; use clean to remove stopped entries.
+
+Usage:
+  ${CODE_SERVER_CLI} stop --instance-name <name>
+  ${CODE_SERVER_CLI} stop --all
+
+Options:
+  --instance-name <name>   Stop a single named instance.
+  -a, --all                Iterate every managed instance and prompt y/N before stopping each.
+                           Mutually exclusive with --instance-name.
+
+Examples:
+  ${CODE_SERVER_CLI} stop --instance-name bin
+  ${CODE_SERVER_CLI} stop --all
+EOF
+}
+
+usage_status() {
+  cat <<EOF
+status
+
+Show managed instances, or reconcile and show one named instance.
+
+Usage:
+  ${CODE_SERVER_CLI} status
+  ${CODE_SERVER_CLI} status --instance-name <name>
+EOF
+}
+
+usage_clean() {
+  cat <<EOF
+clean
+
+Remove stopped instances from manager state after reconciling tracked instances.
+
+Usage:
+  ${CODE_SERVER_CLI} clean
+EOF
+}
+
+show_command_help() {
+  case "$1" in
+    start) usage_start ;;
+    stop) usage_stop ;;
+    status) usage_status ;;
+    restart)
+      usage_start
+      printf '\nrestart\n\nUsage:\n  %s restart --instance-name <name>\n' "${CODE_SERVER_CLI}"
+      ;;
+    clean) usage_clean ;;
+    profile) code_server_profile_usage ;;
+    *) code_server_usage ;;
+  esac
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  fi
+}
+
+load_settings() {
+  local service
+  local value
+  local configured_value
+
+  if [[ -z "$SETTINGS_FILE" || ! -e "$SETTINGS_FILE" ]]; then
+    return
+  fi
+  require_cmd jq
+  if [[ ! -f "$SETTINGS_FILE" ]] || ! jq -e '.version == 1 and (.services | type == "object")' "$SETTINGS_FILE" >/dev/null 2>&1; then
+    echo "Invalid dev-stack settings file: $SETTINGS_FILE" >&2
+    exit 1
+  fi
+
+  for service in code-server filebrowser porterminal go2rtc www; do
+    value="$(jq -r --arg service "$service" \
+      '.services[$service].enabled as $enabled
+       | if $enabled == null then true else $enabled end
+       | if type == "boolean" then tostring else "invalid" end' \
+      "$SETTINGS_FILE")"
+    case "$value" in
+      true|false) ;;
+      *)
+        echo "Invalid enabled setting for service $service in $SETTINGS_FILE" >&2
+        exit 1
+        ;;
+    esac
+    case "$service" in
+      code-server) CODE_SERVER_ENABLED="$value" ;;
+      filebrowser) FILEBROWSER_ENABLED="$value" ;;
+      porterminal) PORTERMINAL_ENABLED="$value" ;;
+      go2rtc) GO2RTC_ENABLED="$value" ;;
+      www) WWW_ENABLED="$value" ;;
+    esac
+  done
+
+  if [[ -z "$GO2RTC_ENV_FILE_OVERRIDE" ]]; then
+    configured_value="$(jq -r '.host.go2rtc.stream_env_file // empty' "$SETTINGS_FILE")"
+    [[ -z "$configured_value" ]] || GO2RTC_ENV_FILE="$configured_value"
+  fi
+  if [[ -z "$GO2RTC_BRIO_DEVICE_OVERRIDE" ]]; then
+    configured_value="$(jq -r '.host.go2rtc.video_device // empty' "$SETTINGS_FILE")"
+    [[ -z "$configured_value" ]] || GO2RTC_BRIO_DEVICE="$configured_value"
+  fi
+  if [[ -z "$GO2RTC_SOUND_DEVICE_OVERRIDE" ]]; then
+    configured_value="$(jq -r '.host.go2rtc.sound_device // empty' "$SETTINGS_FILE")"
+    [[ -z "$configured_value" ]] || GO2RTC_SOUND_DEVICE="$configured_value"
+  fi
+}
+
+service_is_enabled() {
+  case "$1" in
+    code-server) [[ "$CODE_SERVER_ENABLED" == "true" ]] ;;
+    filebrowser) [[ "$FILEBROWSER_ENABLED" == "true" ]] ;;
+    porterminal) [[ "$PORTERMINAL_ENABLED" == "true" ]] ;;
+    go2rtc) [[ "$GO2RTC_ENABLED" == "true" ]] ;;
+    www) [[ "$WWW_ENABLED" == "true" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+require_service_enabled() {
+  local service="$1"
+  if ! service_is_enabled "$service"; then
+    echo "Service $service is disabled in ${SETTINGS_FILE:-dev-stack settings}." >&2
+    exit 4
+  fi
+}
+
+ensure_state() {
+  mkdir -p "$STATE_DIR"
+  if [[ ! -s "$STATE_FILE" ]]; then
+    printf '{\n  "version": 1,\n  "instances": {}\n}\n' > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  elif ! jq empty "$STATE_FILE" >/dev/null 2>&1; then
+    echo "State file is invalid JSON: $STATE_FILE" >&2
+    exit 1
+  fi
+}
+
+read_state_json() {
+  cat "$STATE_FILE"
+}
+
+write_state_json_from_string() {
+  local content="$1"
+  local tmp_file
+  tmp_file="$(mktemp "${STATE_DIR}/state.json.tmp.XXXXXX")"
+  printf '%s\n' "$content" > "$tmp_file"
+  mv "$tmp_file" "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+}
+
+state_apply_jq() {
+  local jq_filter="$1"
+  shift
+  local updated_json
+  if ! updated_json="$(jq "$jq_filter" "$STATE_FILE" "$@")"; then
+    echo "Failed to update state file: $STATE_FILE" >&2
+    exit 1
+  fi
+  if [[ -z "$updated_json" ]]; then
+    echo "Refusing to write empty state to $STATE_FILE" >&2
+    exit 1
+  fi
+  write_state_json_from_string "$updated_json"
+}
+
+normalize_instance_name() {
+  local value="${1,,}"
+  if [[ ! "$value" =~ ^[a-z0-9-]+$ ]]; then
+    echo "Invalid instance name: $1. Allowed characters: a-z, 0-9, -" >&2
+    exit 1
+  fi
+  printf '%s\n' "$value"
+}
+
+ensure_code_server_profiles_state() {
+  local profile_type
+  profile_type="$(jq -r 'if .profiles == null then "missing" else (.profiles | type) end' "$STATE_FILE")"
+  case "$profile_type" in
+    missing) state_apply_jq '.profiles = {}' ;;
+    object) ;;
+    *)
+      echo "Code Server profile state must be a JSON object: $STATE_FILE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+code_server_profile_save() {
+  local name
+  local status
+  local workspace
+  name="$(normalize_instance_name "$1")"
+  if ! state_instance_exists "$name"; then
+    echo "Cannot save profile: instance not found: $name" >&2
+    exit 1
+  fi
+  status="$(state_get_string "$name" status)"
+  if [[ "$status" != "running" ]]; then
+    echo "Cannot save profile: instance '$name' is not running (status=${status:-unknown})." >&2
+    exit 1
+  fi
+  workspace="$(state_get_string "$name" workspace_dir)"
+  if [[ -z "$workspace" || ! -d "$workspace" ]]; then
+    echo "Cannot save profile: workspace directory not found: ${workspace:-<unset>}" >&2
+    exit 1
+  fi
+  workspace="$(realpath -- "$workspace")"
+  state_apply_jq \
+    '.profiles[$name] = {name: $name, workspace_dir: $workspace}' \
+    --arg name "$name" \
+    --arg workspace "$workspace"
+  echo "Saved Code Server profile '$name' for $workspace."
+}
+
+code_server_profile_list() {
+  local json_output="$1"
+  if [[ "$json_output" == "true" ]]; then
+    jq '{profiles: [.profiles | to_entries[]? | {name: .key, workspace_dir: .value.workspace_dir}] | sort_by(.name)}' "$STATE_FILE"
+    return
+  fi
+
+  local count
+  count="$(jq '.profiles | length' "$STATE_FILE")"
+  echo "${C_BOLD}dev_stack code-server saved profiles${C_RESET}"
+  echo "saved profiles: ${C_BOLD}${count}${C_RESET}"
+  if [[ "$count" -eq 0 ]]; then
+    echo "  ${C_DIM}<none>${C_RESET}"
+    return
+  fi
+  jq -r '.profiles | to_entries | sort_by(.key) | .[] | [.key, .value.workspace_dir] | @tsv' "$STATE_FILE" \
+    | while IFS=$'\t' read -r name workspace; do
+        echo "  ${C_BOLD}${name}${C_RESET}  ${C_DIM}${workspace}${C_RESET}"
+      done
+}
+
+code_server_profile_start() {
+  local name
+  local workspace
+  name="$(normalize_instance_name "$1")"
+  workspace="$(jq -r --arg name "$name" '.profiles[$name].workspace_dir // empty' "$STATE_FILE")"
+  if [[ -z "$workspace" ]]; then
+    echo "Saved Code Server profile not found: $name" >&2
+    exit 1
+  fi
+  if [[ ! -d "$workspace" ]]; then
+    echo "Saved workspace directory not found: $workspace" >&2
+    exit 1
+  fi
+  exec "$0" code-server start --instance-name "$name" --workspace-dir "$workspace"
+}
+
+code_server_profile_delete() {
+  local name
+  name="$(normalize_instance_name "$1")"
+  if ! jq -e --arg name "$name" '.profiles[$name] != null' "$STATE_FILE" >/dev/null; then
+    echo "Saved Code Server profile not found: $name" >&2
+    exit 1
+  fi
+  state_apply_jq 'del(.profiles[$name])' --arg name "$name"
+  echo "Deleted Code Server profile '$name'."
+}
+
+code_server_profile_main() {
+  ensure_state
+  ensure_code_server_profiles_state
+  local action="${1:-}"
+  case "$action" in
+    save|start|delete)
+      if [[ $# -ne 2 ]]; then
+        code_server_profile_usage >&2
+        exit 1
+      fi
+      case "$action" in
+        save) code_server_profile_save "$2" ;;
+        start) code_server_profile_start "$2" ;;
+        delete) code_server_profile_delete "$2" ;;
+      esac
+      ;;
+    list)
+      if [[ $# -eq 1 ]]; then
+        code_server_profile_list false
+      elif [[ $# -eq 2 && "$2" == "--json" ]]; then
+        code_server_profile_list true
+      else
+        code_server_profile_usage >&2
+        exit 1
+      fi
+      ;;
+    help|-h|--help) code_server_profile_usage ;;
+    *)
+      code_server_profile_usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+generate_random_instance_name() {
+  local adjective
+  local surname
+  local candidate
+  local attempt
+
+  for attempt in $(seq 1 20); do
+    adjective="${RANDOM_ADJECTIVES[RANDOM % ${#RANDOM_ADJECTIVES[@]}]}"
+    surname="${RANDOM_SURNAMES[RANDOM % ${#RANDOM_SURNAMES[@]}]}"
+    candidate="${adjective}-${surname}"
+    if ! state_instance_exists "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "Could not generate a unique random instance name." >&2
+  exit 1
+}
+
+instance_route_path() {
+  local name="$1"
+  printf '%s/%s\n' "$TAILSCALE_NAMESPACE" "$name"
+}
+
+state_instance_exists() {
+  local name="$1"
+  jq -e --arg name "$name" '.instances[$name] != null' "$STATE_FILE" >/dev/null
+}
+
+state_get_string() {
+  local name="$1"
+  local key="$2"
+  jq -r --arg name "$name" --arg key "$key" '.instances[$name][$key] // empty' "$STATE_FILE"
+}
+
+state_put_instance_json() {
+  local name="$1"
+  local instance_json="$2"
+  state_apply_jq '.instances[$name] = $instance' --arg name "$name" --argjson instance "$instance_json"
+}
+
+state_update_field() {
+  local name="$1"
+  local key="$2"
+  local value_json="$3"
+  state_apply_jq '.instances[$name][$key] = $value' --arg name "$name" --arg key "$key" --argjson value "$value_json"
+}
+
+generate_instance_password() {
+  openssl rand -hex 16
+}
+
+canonicalize_path() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    return
+  fi
+  realpath -m -- "$path" 2>/dev/null || printf '%s' "$path"
+}
+
+find_running_instance_for_workspace() {
+  local candidate="$1"
+  local exclude_name="$2"
+  local candidate_canon
+  candidate_canon="$(canonicalize_path "$candidate")"
+  if [[ -z "$candidate_canon" ]]; then
+    return
+  fi
+
+  local other_name
+  local other_workspace
+  local other_canon
+  while IFS=$'\t' read -r other_name other_workspace; do
+    [[ -z "$other_name" ]] && continue
+    [[ "$other_name" == "$exclude_name" ]] && continue
+    [[ -z "$other_workspace" ]] && continue
+    other_canon="$(canonicalize_path "$other_workspace")"
+    if [[ "$other_canon" == "$candidate_canon" ]]; then
+      printf '%s\n' "$other_name"
+      return
+    fi
+  done < <(jq -r '
+    .instances
+    | to_entries[]?
+    | select(.value.status == "running")
+    | [.key, (.value.workspace_dir // "")]
+    | @tsv
+  ' "$STATE_FILE")
+}
+
+state_merge_runtime() {
+  local name="$1"
+  local status="$2"
+  local pid_json="$3"
+  local port_json="$4"
+  local log_file_json="$5"
+  local tailscale_url_json="$6"
+  local started_at_json="$7"
+  state_apply_jq \
+    '.instances[$name].status = $status |
+     .instances[$name].pid = $pid |
+     .instances[$name].port = $port |
+     .instances[$name].log_file = $log_file |
+     .instances[$name].tailscale_url = $tailscale_url |
+     .instances[$name].started_at = $started_at' \
+    --arg name "$name" \
+    --arg status "$status" \
+    --argjson pid "$pid_json" \
+    --argjson port "$port_json" \
+    --argjson log_file "$log_file_json" \
+    --argjson tailscale_url "$tailscale_url_json" \
+    --argjson started_at "$started_at_json"
+}
+
+is_port_listening() {
+  local host="$1"
+  local port="$2"
+  if [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]]; then
+    ss -ltn | awk '{print $4}' | grep -Eq "^(127\\.0\\.0\\.1|\\*):${port}$|^\\[::1\\]:${port}$"
+  else
+    ss -ltn | awk '{print $4}' | grep -Eq "(^|[\\[\\]:])${port}$"
+  fi
+}
+
+find_free_port() {
+  local port
+  for port in $(seq 9000 9999); do
+    if ! is_port_listening "127.0.0.1" "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  echo "Could not find a free port in 9000-9999" >&2
+  exit 1
+}
+
+process_is_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+recorded_target_matches() {
+  local path="$1"
+  local target="$2"
+  local serve_json
+  if serve_json="$(tailscale serve status --json 2>/dev/null)"; then
+    jq -e --arg path "$path" --arg target "$target" '
+      def norm: if . == "/" then "/" else rtrimstr("/") end;
+      [.Web[]?.Handlers? | to_entries[]? | select((.key | norm) == ($path | norm)) | .value.Proxy]
+      | any(. == $target)
+    ' <<<"$serve_json" >/dev/null 2>&1
+    return
+  fi
+  tailscale serve status 2>/dev/null | grep -E "^[|]-{2} ${path}([[:space:]]|$)" | grep -F "$target" >/dev/null 2>&1
+}
+
+tailscale_route_present() {
+  local path="$1"
+  local serve_json
+  if serve_json="$(tailscale serve status --json 2>/dev/null)"; then
+    jq -e --arg path "$path" '
+      def norm: if . == "/" then "/" else rtrimstr("/") end;
+      [.Web[]?.Handlers? | to_entries[]? | select((.key | norm) == ($path | norm))]
+      | length > 0
+    ' <<<"$serve_json" >/dev/null 2>&1
+    return
+  fi
+  tailscale serve status 2>/dev/null | grep -E "^[|]-{2} ${path}([[:space:]]|$)" >/dev/null 2>&1
+}
+
+find_tailscale_url() {
+  local dns_name
+  dns_name="$(tailscale status --json | jq -r '.Self.DNSName // empty' | sed 's/\.$//')"
+  if [[ -z "$dns_name" ]]; then
+    return
+  fi
+  if [[ "$RESOLVED_TAILSCALE_PATH" == "/" ]]; then
+    printf 'https://%s/\n' "$dns_name"
+    return
+  fi
+  printf 'https://%s%s/\n' "$dns_name" "$RESOLVED_TAILSCALE_PATH"
+}
+
+require_sudo_access() {
+  sudo -v
+}
+
+prompt_for_sudo_fallback() {
+  local action="$1"
+  local answer=""
+  echo "Tailscale Serve ${action} needs permission to manage the local Tailscale daemon."
+  echo "You can either configure Tailscale operator access for this user, or retry with sudo now."
+  read -r -p "Retry ${action} with sudo and enter your password if prompted? [y/N] " answer
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+run_tailscale_serve_command() {
+  local action_label="$1"
+  shift
+  if tailscale "$@"; then
+    return 0
+  fi
+
+  echo "Unprivileged tailscale access failed for: tailscale $*" >&2
+  echo "If this user should manage Tailscale without sudo, configure operator access with:" >&2
+  echo "  sudo tailscale set --operator=${USER}" >&2
+
+  if ! prompt_for_sudo_fallback "$action_label"; then
+    return 1
+  fi
+
+  require_sudo_access
+  sudo tailscale "$@"
+}
+
+configure_tailscale_route() {
+  require_cmd tailscale
+  run_tailscale_serve_command "route setup" serve --bg --https=443 --set-path "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}" >/dev/null
+}
+
+remove_tailscale_route() {
+  require_cmd tailscale
+  run_tailscale_serve_command "route removal" serve --https=443 --set-path "$RESOLVED_TAILSCALE_PATH" off >/dev/null
+}
+
+ensure_no_route_collision() {
+  local existing_instance
+  existing_instance="$(jq -r --arg path "$RESOLVED_TAILSCALE_PATH" '
+    .instances
+    | to_entries[]?
+    | select(.value.tailscale_path == $path and .key != $instance and .value.status == "running")
+    | .key
+  ' --arg instance "$RESOLVED_INSTANCE_NAME" "$STATE_FILE" | head -n1)"
+
+  if [[ -n "$existing_instance" ]]; then
+    echo "Route collision: $RESOLVED_TAILSCALE_PATH is already owned by running instance $existing_instance" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+      echo "Route collision: live Tailscale Serve route already exists for unmanaged path $RESOLVED_TAILSCALE_PATH." >&2
+      exit 1
+    fi
+    if ! recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+      echo "Route collision: live Tailscale Serve route already exists for $RESOLVED_TAILSCALE_PATH" >&2
+      exit 1
+    fi
+  fi
+}
+
+resolve_config() {
+  local state_name
+  local state_workspace_dir
+  local state_port
+  local state_bind_host
+  local state_tailscale_enable
+
+  if [[ "$COMMAND" == "start" && -z "$CLI_INSTANCE_NAME" ]]; then
+    RESOLVED_INSTANCE_NAME="$(generate_random_instance_name)"
+  else
+    RESOLVED_INSTANCE_NAME="${CLI_INSTANCE_NAME:-general}"
+  fi
+  RESOLVED_INSTANCE_NAME="$(normalize_instance_name "$RESOLVED_INSTANCE_NAME")"
+  if state_instance_exists "$RESOLVED_INSTANCE_NAME"; then
+    INSTANCE_IN_STATE="true"
+  else
+    INSTANCE_IN_STATE="false"
+  fi
+
+  state_name="$RESOLVED_INSTANCE_NAME"
+  state_workspace_dir="$(state_get_string "$state_name" workspace_dir)"
+  state_port="$(state_get_string "$state_name" port)"
+  state_bind_host="$(state_get_string "$state_name" bind_host)"
+  state_tailscale_enable="$(state_get_string "$state_name" tailscale_enable)"
+
+  RESOLVED_WORKSPACE_DIR="${CLI_WORKSPACE_DIR:-$state_workspace_dir}"
+  RESOLVED_BIND_HOST="${CLI_BIND_HOST:-${state_bind_host:-$DEFAULT_BIND_HOST}}"
+  RESOLVED_TAILSCALE_ENABLE="${CLI_TAILSCALE_ENABLE:-$DEFAULT_TAILSCALE_ENABLE}"
+  RESOLVED_PORT="${CLI_PORT:-$state_port}"
+  RESOLVED_TAILSCALE_PATH="$(instance_route_path "$RESOLVED_INSTANCE_NAME")"
+  RESOLVED_LOG_FILE="${DEFAULT_LOG_DIR}/code-server-${RESOLVED_INSTANCE_NAME}.log"
+
+  if [[ -n "$RESOLVED_PORT" ]] && { ! [[ "$RESOLVED_PORT" =~ ^[0-9]+$ ]] || (( RESOLVED_PORT <= 0 || RESOLVED_PORT > 65535 )); }; then
+    echo "Invalid port: $RESOLVED_PORT" >&2
+    exit 1
+  fi
+
+  if [[ -n "$RESOLVED_WORKSPACE_DIR" ]] && [[ ! -d "$RESOLVED_WORKSPACE_DIR" ]]; then
+    echo "Workspace directory not found: $RESOLVED_WORKSPACE_DIR" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" != "true" && "$RESOLVED_TAILSCALE_ENABLE" != "false" ]]; then
+    echo "TAILSCALE_ENABLE must be true or false" >&2
+    exit 1
+  fi
+}
+
+write_instance_definition() {
+  local instance_json
+  instance_json="$(jq -n \
+    --arg instance_name "$RESOLVED_INSTANCE_NAME" \
+    --arg workspace_dir "$RESOLVED_WORKSPACE_DIR" \
+    --arg bind_host "$RESOLVED_BIND_HOST" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg tailscale_path "$RESOLVED_TAILSCALE_PATH" \
+    --arg status "unknown" \
+    '{instance_name: $instance_name, workspace_dir: $workspace_dir, bind_host: $bind_host, tailscale_enable: $tailscale_enable, tailscale_path: $tailscale_path, status: $status}')"
+  state_put_instance_json "$RESOLVED_INSTANCE_NAME" "$instance_json"
+}
+
+render_status() {
+  local pid="$1"
+  local observed_status="$2"
+  local target=""
+  local route_present="no"
+  local route_match="no"
+  local url=""
+  local bind_addr="${RESOLVED_BIND_HOST}:<unset>"
+
+  if [[ -n "$RESOLVED_PORT" ]]; then
+    target="http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+    bind_addr="${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  fi
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    route_present="yes"
+  fi
+  if [[ -n "$target" ]] && recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "$target"; then
+    route_match="yes"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    url="$(find_tailscale_url || true)"
+  fi
+
+  local started_at_pretty=""
+  if [[ "$observed_status" == "running" ]]; then
+    started_at_pretty="$(format_started_at "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)")"
+  fi
+  local stored_password
+  stored_password="$(state_get_string "$RESOLVED_INSTANCE_NAME" password)"
+
+  echo "${C_BOLD}dev_stack code-server status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "$observed_status") ${C_BOLD}${observed_status}${C_RESET}"
+  echo "  workspace  ${C_DIM}${RESOLVED_WORKSPACE_DIR:-<unset>}${C_RESET}"
+  echo "  bind       ${bind_addr}"
+  echo "  pid        ${pid:-<none>}"
+  echo "  log        ${RESOLVED_LOG_FILE}"
+  echo "  tailscale  $(format_yes_no "$RESOLVED_TAILSCALE_ENABLE")  path=${RESOLVED_TAILSCALE_PATH}"
+  echo "  route      present=${route_present}  backend_match=${route_match}"
+  if [[ -n "$url" ]]; then
+    echo "  url        ${C_CYAN}${url}${C_RESET}"
+  fi
+  if [[ -n "$stored_password" ]]; then
+    echo "  password   ${stored_password}"
+  fi
+  if [[ -n "$started_at_pretty" ]]; then
+    echo "  running    since ${started_at_pretty}"
+  fi
+}
+
+render_instance_not_found() {
+  echo "${C_BOLD}dev_stack code-server status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "not_found") ${C_BOLD}not_found${C_RESET}"
+  echo "  instance   ${C_DIM}not managed${C_RESET}"
+  echo "  path       ${RESOLVED_TAILSCALE_PATH}"
+}
+
+require_explicit_instance_for_mutation() {
+  if [[ "$EXPLICIT_INSTANCE_REQUEST" == "true" ]]; then
+    return
+  fi
+  echo "${COMMAND} requires --instance-name." >&2
+  echo "See: ${CODE_SERVER_CLI} help ${COMMAND}" >&2
+  exit 1
+}
+
+render_status_summary() {
+  local instance_count
+  local instance_names
+  local name
+
+  instance_names="$(jq -r '.instances | keys[]?' "$STATE_FILE")"
+  for name in $instance_names; do
+    "$0" code-server status --instance-name "$name" >/dev/null 2>&1 || true
+  done
+
+  instance_count="$(jq '.instances | length' "$STATE_FILE")"
+
+  echo "${C_BOLD}dev_stack code-server status${C_RESET}"
+  echo "managed instances: ${C_BOLD}${instance_count}${C_RESET}"
+  if [[ "$instance_count" -eq 0 ]]; then
+    echo "  ${C_DIM}<none>${C_RESET}"
+    return
+  fi
+
+  while IFS=$'\t' read -r name status bind_host port pid tailscale_enable workspace url tailscale_path started_at password; do
+    local color
+    local route_present="no"
+    local started_at_pretty=""
+    color="$(status_color "$status")"
+    if tailscale_route_present "$tailscale_path"; then
+      route_present="yes"
+    fi
+    if [[ "$status" == "running" ]]; then
+      started_at_pretty="$(format_started_at "$started_at")"
+    fi
+    echo "  $(status_dot "$status") ${C_BOLD}${name}${C_RESET}  ${color}${status}${C_RESET}"
+    echo "    bind       ${bind_host}:${port}"
+    echo "    pid        ${pid}"
+    echo "    tailscale  configured=$(format_yes_no "$tailscale_enable")  route=$(format_yes_no "$route_present")"
+    echo "    workspace  ${C_DIM}${workspace}${C_RESET}"
+    if [[ -n "$url" && "$url" != "null" ]]; then
+      echo "    url        ${C_CYAN}${url}${C_RESET}"
+    fi
+    if [[ -n "$password" ]]; then
+      echo "    password   ${password}"
+    fi
+    if [[ -n "$started_at_pretty" ]]; then
+      echo "    running    since ${started_at_pretty}"
+    fi
+  done < <(
+    jq -r '
+      .instances
+      | to_entries
+      | sort_by(.key)
+      | .[]
+      | [
+          .key,
+          (.value.status // "unknown"),
+          (.value.bind_host // "127.0.0.1"),
+          ((.value.port // "<unset>") | tostring),
+          ((.value.pid // "<none>") | tostring),
+          (.value.tailscale_enable // "false"),
+          (.value.workspace_dir // "<unset>"),
+          ((.value.tailscale_url // "null") | tostring),
+          (.value.tailscale_path // ""),
+          (.value.started_at // ""),
+          (.value.password // "")
+        ]
+      | @tsv
+    ' "$STATE_FILE"
+  )
+}
+
+reconcile_all_instances() {
+  local instance_names
+  local name
+  instance_names="$(jq -r '.instances | keys[]?' "$STATE_FILE")"
+  for name in $instance_names; do
+    "$0" code-server status --instance-name "$name" >/dev/null 2>&1 || true
+  done
+}
+
+running_instance_count() {
+  reconcile_all_instances
+  jq '[.instances | to_entries[]? | select(.value.status == "running")] | length' "$STATE_FILE"
+}
+
+reconcile_status() {
+  local recorded_pid
+  local pid_alive="false"
+  local listener_alive="false"
+  local route_ok="false"
+  local observed_status="stopped"
+  local tailscale_url_json="null"
+  local started_at_json
+  local should_persist="false"
+
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$recorded_pid"; then
+    pid_alive="true"
+  fi
+  if [[ -n "$RESOLVED_PORT" ]] && is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    listener_alive="true"
+  fi
+  if [[ -n "$RESOLVED_PORT" ]] && [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    route_ok="true"
+    tailscale_url_json="$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')"
+  fi
+
+  if [[ "$pid_alive" == "true" && "$listener_alive" == "true" ]]; then
+    observed_status="running"
+  elif [[ "$pid_alive" == "false" && "$listener_alive" == "false" ]]; then
+    observed_status="stopped"
+  else
+    observed_status="drifted"
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" && "$route_ok" == "false" && "$observed_status" == "running" ]]; then
+    observed_status="drifted"
+  fi
+
+  if [[ "$INSTANCE_IN_STATE" == "true" || "$pid_alive" == "true" || "$listener_alive" == "true" || "$route_ok" == "true" ]]; then
+    should_persist="true"
+  fi
+
+  if [[ "$should_persist" != "true" ]]; then
+    render_instance_not_found
+    return
+  fi
+
+  if [[ "$should_persist" == "true" ]]; then
+    if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+      write_instance_definition
+    fi
+    started_at_json="$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+    state_merge_runtime \
+      "$RESOLVED_INSTANCE_NAME" \
+      "$observed_status" \
+      "${recorded_pid:-null}" \
+      "${RESOLVED_PORT:-null}" \
+      "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+      "$tailscale_url_json" \
+      "$started_at_json"
+  fi
+
+  render_status "$recorded_pid" "$observed_status"
+}
+
+start_instance() {
+  require_cmd code-server
+  require_cmd jq
+  require_cmd pgrep
+  require_cmd setsid
+  require_cmd ss
+  require_cmd openssl
+
+  local running_count
+  local recorded_pid
+  running_count="$(running_instance_count)"
+  if (( running_count >= 5 )); then
+    echo "Refusing to start a new instance: ${running_count} instances are already running (limit: 5)." >&2
+    echo "See: ${CODE_SERVER_CLI} help start" >&2
+    exit 1
+  fi
+
+  if [[ -z "$RESOLVED_WORKSPACE_DIR" ]]; then
+    RESOLVED_WORKSPACE_DIR="$PWD"
+  fi
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if [[ "$INSTANCE_IN_STATE" == "true" ]] && process_is_alive "$recorded_pid"; then
+    local recorded_bind_host
+    local recorded_port
+    recorded_bind_host="$(state_get_string "$RESOLVED_INSTANCE_NAME" bind_host)"
+    recorded_port="$(state_get_string "$RESOLVED_INSTANCE_NAME" port)"
+    echo "Instance ${RESOLVED_INSTANCE_NAME} is already running with pid ${recorded_pid} on ${recorded_bind_host:-<unknown>}:${recorded_port:-<unknown>}." >&2
+    echo "See: ${CODE_SERVER_CLI} help start" >&2
+    exit 1
+  fi
+
+  local conflicting_instance
+  conflicting_instance="$(find_running_instance_for_workspace "$RESOLVED_WORKSPACE_DIR" "$RESOLVED_INSTANCE_NAME")"
+  if [[ -n "$conflicting_instance" ]]; then
+    echo "Refusing to start: instance '${conflicting_instance}' is already running on workspace ${RESOLVED_WORKSPACE_DIR}." >&2
+    echo >&2
+    "$0" code-server status --instance-name "$conflicting_instance" 1>&2 || true
+    exit 1
+  fi
+
+  if [[ -z "$RESOLVED_PORT" ]]; then
+    RESOLVED_PORT="$(find_free_port)"
+  fi
+
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    echo "Port ${RESOLVED_PORT} is already in use" >&2
+    echo "See: ${CODE_SERVER_CLI} help start" >&2
+    exit 1
+  fi
+
+  write_instance_definition
+  INSTANCE_IN_STATE="true"
+  ensure_no_route_collision
+
+  local instance_password
+  instance_password="$(generate_instance_password)"
+
+  local start_cmd=(code-server --bind-addr "${RESOLVED_BIND_HOST}:${RESOLVED_PORT}" --auth password)
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    start_cmd+=(--abs-proxy-base-path "${RESOLVED_TAILSCALE_PATH}")
+  fi
+  start_cmd+=(--ignore-last-opened)
+  start_cmd+=("$RESOLVED_WORKSPACE_DIR")
+  PASSWORD="$instance_password" setsid nohup "${start_cmd[@]}" >"$RESOLVED_LOG_FILE" 2>&1 < /dev/null &
+  local pid=$!
+  sleep 2
+
+  if ! process_is_alive "$pid"; then
+    echo "code-server failed to start. Check $RESOLVED_LOG_FILE" >&2
+    echo "See: ${CODE_SERVER_CLI} help start" >&2
+    exit 1
+  fi
+
+  if [[ "$CLI_PASSWORD_NO_SAVE" != "true" ]]; then
+    state_update_field "$RESOLVED_INSTANCE_NAME" password "$(jq -Rn --arg value "$instance_password" '$value')"
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    if ! configure_tailscale_route; then
+      state_merge_runtime \
+        "$RESOLVED_INSTANCE_NAME" \
+        "drifted" \
+        "$pid" \
+        "$RESOLVED_PORT" \
+        "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+        "null" \
+        "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+      echo "code-server started locally on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}, but Tailscale Serve configuration failed." >&2
+      echo "  password: ${instance_password}" >&2
+      echo "See: ${CODE_SERVER_CLI} help start" >&2
+      exit 1
+    fi
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "running" \
+    "$pid" \
+    "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')" \
+    "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+
+  echo "code-server started for instance ${RESOLVED_INSTANCE_NAME}."
+  echo "  local: http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    echo "  tailscale: $(find_tailscale_url || true)"
+  else
+    echo "  tailscale: disabled"
+  fi
+  echo "  password: ${instance_password}"
+  if [[ "$CLI_PASSWORD_NO_SAVE" == "true" ]]; then
+    echo "  ${C_YELLOW}note: password not saved to state (--password-no-save). Copy it now or you'll need to restart the instance.${C_RESET}"
+  else
+    echo "  ${C_YELLOW}note: password is saved in plaintext at ${STATE_FILE} so it can be recovered via 'status'. Use --password-no-save to opt out.${C_RESET}"
+  fi
+
+  reconcile_status
+}
+
+stop_instance() {
+  local pid
+  local local_stopped="true"
+  local tailscale_cleared="true"
+  local final_status="stopped"
+  require_explicit_instance_for_mutation
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "Instance not found: $RESOLVED_INSTANCE_NAME" >&2
+    echo "See: ${CODE_SERVER_CLI} help stop" >&2
+    exit 1
+  fi
+  pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+
+  if process_is_alive "$pid"; then
+    kill "$pid" >/dev/null 2>&1 || true
+    sleep 1
+    if process_is_alive "$pid"; then
+      local_stopped="false"
+    fi
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+      if ! remove_tailscale_route; then
+        tailscale_cleared="false"
+      fi
+    fi
+  fi
+
+  if [[ "$local_stopped" != "true" || "$tailscale_cleared" != "true" ]]; then
+    final_status="drifted"
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$final_status" \
+    "$(if [[ "$local_stopped" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$pid" '$value|tonumber'; fi)" \
+    "${RESOLVED_PORT:-null}" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$tailscale_cleared" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; fi)" \
+    "$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+
+  reconcile_status
+}
+
+stop_all_instances() {
+  if ! [[ -t 0 ]]; then
+    echo "stop --all requires an interactive terminal for confirmation prompts." >&2
+    exit 1
+  fi
+
+  local instance_names
+  instance_names="$(jq -r '.instances | keys[]?' "$STATE_FILE")"
+  if [[ -z "$instance_names" ]]; then
+    echo "No managed instances."
+    return
+  fi
+
+  local name
+  local status
+  local pid
+  local answer
+  for name in $instance_names; do
+    status="$(state_get_string "$name" status)"
+    pid="$(state_get_string "$name" pid)"
+    answer=""
+    read -r -p "Stop instance '${name}' (status=${status:-unknown}, pid=${pid:-<none>})? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+      "$0" code-server stop --instance-name "$name" || true
+    else
+      echo "  skipped ${name}"
+    fi
+  done
+}
+
+clean_instances() {
+  local instance_names
+  local name
+  instance_names="$(jq -r '.instances | keys[]?' "$STATE_FILE")"
+  for name in $instance_names; do
+    "$0" code-server status --instance-name "$name" >/dev/null || true
+  done
+
+  local result
+  result="$(jq '
+    [(.instances | to_entries[]? | select(.value.status == "stopped"))] as $removed
+    | .instances |= with_entries(select(.value.status != "stopped"))
+    | {state: ., removed_count: ($removed | length)}
+  ' "$STATE_FILE")"
+  write_state_json_from_string "$(jq -c '.state' <<<"$result")"
+  echo "Removed $(jq -r '.removed_count' <<<"$result") stopped instance(s) from state."
+}
+
+filebrowser_show_command_help() {
+  case "$1" in
+    start|stop|status|restart|clean|"") filebrowser_usage ;;
+    *) filebrowser_usage ;;
+  esac
+}
+
+parse_filebrowser_args() {
+  if [[ $# -lt 1 ]]; then
+    filebrowser_usage
+    exit 1
+  fi
+
+  case "$1" in
+    help)
+      filebrowser_show_command_help "${2:-}"
+      exit 0
+      ;;
+    -h|--help)
+      filebrowser_usage
+      exit 0
+      ;;
+  esac
+
+  COMMAND="$1"
+  shift
+
+  if [[ "$COMMAND" == "password" ]]; then
+    if [[ "${1:-}" != "reset" || $# -ne 1 ]]; then
+      echo "Usage: ${FILEBROWSER_CLI} password reset" >&2
+      exit 1
+    fi
+    COMMAND="password-reset"
+    shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        if [[ $# -lt 2 ]]; then
+          echo "--port requires a value" >&2
+          exit 1
+        fi
+        CLI_PORT="$2"
+        shift 2
+        ;;
+      --bind-host)
+        if [[ $# -lt 2 ]]; then
+          echo "--bind-host requires a value" >&2
+          exit 1
+        fi
+        CLI_BIND_HOST="$2"
+        shift 2
+        ;;
+      --tailscale-no-serve)
+        CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      --instance-name|--workspace-dir|--password-no-save)
+        echo "$1 is not supported for filebrowser." >&2
+        echo "See: ${FILEBROWSER_CLI} help" >&2
+        exit 1
+        ;;
+      -h|--help|help)
+        filebrowser_show_command_help "$COMMAND"
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        filebrowser_usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+filebrowser_resolve_config() {
+  local state_port
+  local state_bind_host
+  local state_tailscale_enable
+
+  RESOLVED_INSTANCE_NAME="$FILEBROWSER_INSTANCE_NAME"
+  RESOLVED_TAILSCALE_PATH="$FILEBROWSER_TAILSCALE_PATH"
+  RESOLVED_LOG_FILE="${DEFAULT_LOG_DIR}/filebrowser.log"
+  RESOLVED_DB_PATH="${DATA_ROOT}/filebrowser.db"
+
+  if state_instance_exists "$RESOLVED_INSTANCE_NAME"; then
+    INSTANCE_IN_STATE="true"
+  else
+    INSTANCE_IN_STATE="false"
+  fi
+
+  state_port="$(state_get_string "$RESOLVED_INSTANCE_NAME" port)"
+  state_bind_host="$(state_get_string "$RESOLVED_INSTANCE_NAME" bind_host)"
+  state_tailscale_enable="$(state_get_string "$RESOLVED_INSTANCE_NAME" tailscale_enable)"
+
+  RESOLVED_BIND_HOST="${CLI_BIND_HOST:-${state_bind_host:-$DEFAULT_BIND_HOST}}"
+  RESOLVED_TAILSCALE_ENABLE="${CLI_TAILSCALE_ENABLE:-${state_tailscale_enable:-$DEFAULT_TAILSCALE_ENABLE}}"
+  RESOLVED_PORT="${CLI_PORT:-${state_port:-$DEFAULT_FILEBROWSER_PORT}}"
+
+  if [[ -n "$RESOLVED_PORT" ]] && { ! [[ "$RESOLVED_PORT" =~ ^[0-9]+$ ]] || (( RESOLVED_PORT <= 0 || RESOLVED_PORT > 65535 )); }; then
+    echo "Invalid port: $RESOLVED_PORT" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" != "true" && "$RESOLVED_TAILSCALE_ENABLE" != "false" ]]; then
+    echo "TAILSCALE_ENABLE must be true or false" >&2
+    exit 1
+  fi
+}
+
+filebrowser_write_instance_definition() {
+  local instance_json
+  local stored_password
+  stored_password="$(filebrowser_saved_password)"
+  instance_json="$(jq -n \
+    --arg instance_name "$RESOLVED_INSTANCE_NAME" \
+    --arg bind_host "$RESOLVED_BIND_HOST" \
+    --arg port "$RESOLVED_PORT" \
+    --arg db_path "$RESOLVED_DB_PATH" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg tailscale_path "$RESOLVED_TAILSCALE_PATH" \
+    --arg password "$stored_password" \
+    --arg status "unknown" \
+    '{instance_name: $instance_name, bind_host: $bind_host, port: ($port | tonumber), db_path: $db_path, tailscale_enable: $tailscale_enable, tailscale_path: $tailscale_path, status: $status}
+     + (if $password == "" then {} else {password: $password} end)')"
+  state_put_instance_json "$RESOLVED_INSTANCE_NAME" "$instance_json"
+}
+
+filebrowser_saved_password() {
+  jq -r --arg name "$RESOLVED_INSTANCE_NAME" \
+    '.credentials.filebrowser.password // .instances[$name].password // empty' \
+    "$STATE_FILE"
+}
+
+filebrowser_save_password() {
+  local password="$1"
+  state_apply_jq \
+    '.credentials.filebrowser = {username: "admin", password: $password}
+     | if .instances[$name] != null then .instances[$name].password = $password else . end' \
+    --arg name "$RESOLVED_INSTANCE_NAME" \
+    --arg password "$password"
+}
+
+filebrowser_render_status() {
+  local pid="$1"
+  local observed_status="$2"
+  local target="http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  local route_present="no"
+  local route_match="no"
+  local url=""
+  local started_at_pretty=""
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    route_present="yes"
+  fi
+  if recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "$target"; then
+    route_match="yes"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    url="$(find_tailscale_url || true)"
+  fi
+  if [[ "$observed_status" == "running" ]]; then
+    started_at_pretty="$(format_started_at "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)")"
+  fi
+
+  echo "${C_BOLD}dev_stack filebrowser status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "$observed_status") ${C_BOLD}${observed_status}${C_RESET}"
+  echo "  root       ${HOME}"
+  echo "  bind       ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  echo "  pid        ${pid:-<none>}"
+  echo "  database   ${RESOLVED_DB_PATH}"
+  echo "  log        ${RESOLVED_LOG_FILE}"
+  echo "  tailscale  $(format_yes_no "$RESOLVED_TAILSCALE_ENABLE")  path=${RESOLVED_TAILSCALE_PATH}"
+  echo "  route      present=${route_present}  backend_match=${route_match}"
+  if [[ -n "$url" ]]; then
+    echo "  url        ${C_CYAN}${url}${C_RESET}"
+  fi
+  if [[ -n "$started_at_pretty" ]]; then
+    echo "  running    since ${started_at_pretty}"
+  fi
+}
+
+filebrowser_render_not_found() {
+  echo "${C_BOLD}dev_stack filebrowser status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "not_found") ${C_BOLD}not_found${C_RESET}"
+  echo "  service    ${C_DIM}not managed${C_RESET}"
+  echo "  path       ${RESOLVED_TAILSCALE_PATH}"
+}
+
+filebrowser_reconcile_status() {
+  local recorded_pid
+  local pid_alive="false"
+  local listener_alive="false"
+  local route_ok="false"
+  local observed_status="stopped"
+  local tailscale_url_json="null"
+  local started_at_json
+  local should_persist="false"
+
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$recorded_pid"; then
+    pid_alive="true"
+  fi
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    listener_alive="true"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    route_ok="true"
+    tailscale_url_json="$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')"
+  fi
+
+  if [[ "$pid_alive" == "true" && "$listener_alive" == "true" ]]; then
+    observed_status="running"
+  elif [[ "$pid_alive" == "false" && "$listener_alive" == "false" ]]; then
+    observed_status="stopped"
+  else
+    observed_status="drifted"
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" && "$route_ok" == "false" && "$observed_status" == "running" ]]; then
+    observed_status="drifted"
+  fi
+
+  if [[ "$INSTANCE_IN_STATE" == "true" || "$pid_alive" == "true" || "$listener_alive" == "true" || "$route_ok" == "true" ]]; then
+    should_persist="true"
+  fi
+
+  if [[ "$should_persist" != "true" ]]; then
+    filebrowser_render_not_found
+    return
+  fi
+
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    filebrowser_write_instance_definition
+    INSTANCE_IN_STATE="true"
+  fi
+  started_at_json="$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$observed_status" \
+    "${recorded_pid:-null}" \
+    "${RESOLVED_PORT:-null}" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$tailscale_url_json" \
+    "$started_at_json"
+
+  filebrowser_render_status "$recorded_pid" "$observed_status"
+}
+
+filebrowser_start() {
+  require_cmd filebrowser
+  require_cmd jq
+  require_cmd ss
+  require_cmd setsid
+
+  local recorded_pid
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if [[ "$INSTANCE_IN_STATE" == "true" ]] && process_is_alive "$recorded_pid"; then
+    echo "filebrowser is already running with pid ${recorded_pid} on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}." >&2
+    echo "See: ${FILEBROWSER_CLI} help start" >&2
+    exit 1
+  fi
+
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    echo "Port ${RESOLVED_PORT} is already in use" >&2
+    echo "See: ${FILEBROWSER_CLI} help start" >&2
+    exit 1
+  fi
+
+  mkdir -p "$STATE_DIR"
+  local bootstrap_password=""
+  local bootstrap_hash=""
+  if [[ ! -s "$RESOLVED_DB_PATH" ]]; then
+    bootstrap_password="$(generate_instance_password)"
+    bootstrap_hash="$(filebrowser hash "$bootstrap_password")"
+  fi
+  filebrowser_write_instance_definition
+  if [[ -n "$bootstrap_password" ]]; then
+    filebrowser_save_password "$bootstrap_password"
+  fi
+  INSTANCE_IN_STATE="true"
+  ensure_no_route_collision
+
+  local start_cmd=(filebrowser --address "$RESOLVED_BIND_HOST" --port "$RESOLVED_PORT" --root "$HOME" --database "$RESOLVED_DB_PATH")
+  if [[ -n "$bootstrap_hash" ]]; then
+    start_cmd+=(--username admin --password "$bootstrap_hash")
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    start_cmd+=(--baseURL "$RESOLVED_TAILSCALE_PATH")
+  fi
+
+  setsid nohup "${start_cmd[@]}" >"$RESOLVED_LOG_FILE" 2>&1 < /dev/null &
+  local pid=$!
+  sleep 2
+
+  if ! process_is_alive "$pid"; then
+    echo "filebrowser failed to start. Check $RESOLVED_LOG_FILE" >&2
+    echo "See: ${FILEBROWSER_CLI} help start" >&2
+    exit 1
+  fi
+  chmod 600 "$RESOLVED_DB_PATH" 2>/dev/null || true
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    if ! configure_tailscale_route; then
+      state_merge_runtime \
+        "$RESOLVED_INSTANCE_NAME" \
+        "drifted" \
+        "$pid" \
+        "$RESOLVED_PORT" \
+        "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+        "null" \
+        "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+      echo "filebrowser started locally on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}, but Tailscale Serve configuration failed." >&2
+      echo "See: ${FILEBROWSER_CLI} help start" >&2
+      exit 1
+    fi
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "running" \
+    "$pid" \
+    "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; else printf 'null'; fi)" \
+    "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+
+  echo "filebrowser started."
+  echo "  local: http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    echo "  tailscale: $(find_tailscale_url || true)"
+  else
+    echo "  tailscale: disabled"
+  fi
+
+  filebrowser_reconcile_status
+}
+
+filebrowser_password_reset() {
+  require_cmd filebrowser
+  require_cmd jq
+  require_cmd openssl
+
+  if [[ ! -s "$RESOLVED_DB_PATH" ]]; then
+    echo "File Browser database does not exist: $RESOLVED_DB_PATH" >&2
+    exit 1
+  fi
+
+  local was_running="false"
+  local recorded_pid
+  local new_password
+  local update_output
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$recorded_pid"; then
+    was_running="true"
+    filebrowser_stop
+  elif is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    echo "Refusing password reset: port ${RESOLVED_PORT} is active but not owned by manager state." >&2
+    exit 1
+  fi
+
+  new_password="$(generate_instance_password)"
+  if ! update_output="$(filebrowser users update admin --password "$new_password" --database "$RESOLVED_DB_PATH" 2>&1)"; then
+    echo "File Browser password reset failed: $update_output" >&2
+    if [[ "$was_running" == "true" ]]; then
+      filebrowser_start || true
+    fi
+    exit 1
+  fi
+
+  filebrowser_save_password "$new_password"
+  chmod 600 "$RESOLVED_DB_PATH" 2>/dev/null || true
+
+  if [[ "$was_running" == "true" ]]; then
+    filebrowser_start
+  fi
+  echo "File Browser admin password reset successfully."
+  echo "  username: admin"
+  echo "  password: ${new_password}"
+  echo "  saved: ${STATE_FILE} (mode 0600)"
+}
+
+filebrowser_stop() {
+  local pid
+  local local_stopped="true"
+  local tailscale_cleared="true"
+  local final_status="stopped"
+
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "filebrowser is not managed." >&2
+    echo "See: ${FILEBROWSER_CLI} help stop" >&2
+    exit 1
+  fi
+
+  pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$pid"; then
+    kill "$pid" >/dev/null 2>&1 || true
+    sleep 1
+    if process_is_alive "$pid"; then
+      local_stopped="false"
+    fi
+  fi
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    if ! remove_tailscale_route; then
+      tailscale_cleared="false"
+    fi
+  fi
+
+  if [[ "$local_stopped" != "true" || "$tailscale_cleared" != "true" ]]; then
+    final_status="drifted"
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$final_status" \
+    "$(if [[ "$local_stopped" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$pid" '$value|tonumber'; fi)" \
+    "${RESOLVED_PORT:-null}" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$tailscale_cleared" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; fi)" \
+    "$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+
+  filebrowser_reconcile_status
+}
+
+filebrowser_clean() {
+  filebrowser_reconcile_status >/dev/null || true
+  if [[ "$(state_get_string "$RESOLVED_INSTANCE_NAME" status)" == "stopped" ]]; then
+    state_apply_jq \
+      '(.credentials.filebrowser.password // .instances[$name].password // "") as $password
+       | del(.instances[$name])
+       | if $password != "" then
+           .credentials.filebrowser = {username: "admin", password: $password}
+         else . end' \
+      --arg name "$RESOLVED_INSTANCE_NAME"
+    echo "Removed stopped filebrowser service from state; saved credential was preserved."
+  else
+    echo "No stopped filebrowser service to remove from state."
+  fi
+}
+
+filebrowser_main() {
+  parse_filebrowser_args "$@"
+  ensure_state
+  filebrowser_resolve_config
+
+  case "$COMMAND" in
+    start)
+      filebrowser_start
+      ;;
+    stop)
+      filebrowser_stop
+      ;;
+    status)
+      filebrowser_reconcile_status
+      ;;
+    restart)
+      if [[ "$INSTANCE_IN_STATE" == "true" ]]; then
+        filebrowser_stop
+      fi
+      filebrowser_start
+      ;;
+    clean)
+      filebrowser_clean
+      ;;
+    password-reset)
+      filebrowser_password_reset
+      ;;
+    *)
+      echo "Unknown command: $COMMAND" >&2
+      filebrowser_usage
+      exit 1
+      ;;
+  esac
+}
+
+porterminal_show_command_help() {
+  case "$1" in
+    start|stop|status|restart|clean|"") porterminal_usage ;;
+    *) porterminal_usage ;;
+  esac
+}
+
+porterminal_saved_password() {
+  jq -r --arg name "$RESOLVED_INSTANCE_NAME" \
+    '.credentials.porterminal.password // .instances[$name].password // empty' \
+    "$STATE_FILE"
+}
+
+porterminal_save_password() {
+  local password="$1"
+  state_apply_jq \
+    '.credentials.porterminal = {password: $password}
+     | if .instances[$name] != null then .instances[$name].password = $password else . end' \
+    --arg name "$RESOLVED_INSTANCE_NAME" \
+    --arg password "$password"
+}
+
+parse_porterminal_args() {
+  if [[ $# -lt 1 ]]; then
+    porterminal_usage
+    exit 1
+  fi
+
+  case "$1" in
+    help)
+      porterminal_show_command_help "${2:-}"
+      exit 0
+      ;;
+    -h|--help)
+      porterminal_usage
+      exit 0
+      ;;
+  esac
+
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        if [[ $# -lt 2 ]]; then
+          echo "--port requires a value" >&2
+          exit 1
+        fi
+        CLI_PORT="$2"
+        shift 2
+        ;;
+      --bind-host)
+        if [[ $# -lt 2 ]]; then
+          echo "--bind-host requires a value" >&2
+          exit 1
+        fi
+        CLI_BIND_HOST="$2"
+        shift 2
+        ;;
+      --snippets)
+        if [[ $# -lt 2 ]]; then
+          echo "--snippets requires a value" >&2
+          exit 1
+        fi
+        CLI_SNIPPETS_PATH="$2"
+        shift 2
+        ;;
+      --password)
+        if [[ $# -lt 2 ]]; then
+          echo "--password requires a value" >&2
+          exit 1
+        fi
+        CLI_PASSWORD="$2"
+        shift 2
+        ;;
+      --tailscale-no-serve)
+        CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      --instance-name|--workspace-dir|--password-no-save)
+        echo "$1 is not supported for porterminal." >&2
+        echo "See: ${PORTERMINAL_CLI} help" >&2
+        exit 1
+        ;;
+      -h|--help|help)
+        porterminal_show_command_help "$COMMAND"
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        porterminal_usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+porterminal_resolve_config() {
+  local state_port
+  local state_bind_host
+  local state_tailscale_enable
+  local state_snippets_path
+  local state_password
+
+  RESOLVED_INSTANCE_NAME="$PORTERMINAL_INSTANCE_NAME"
+  RESOLVED_TAILSCALE_PATH="$PORTERMINAL_TAILSCALE_PATH"
+  RESOLVED_LOG_FILE="${DEFAULT_LOG_DIR}/porterminal.log"
+  RESOLVED_RUNNER_PATH=""
+  RESOLVED_CONFIG_PATH="$PORTERMINAL_CONFIG_PATH"
+
+  if state_instance_exists "$RESOLVED_INSTANCE_NAME"; then
+    INSTANCE_IN_STATE="true"
+  else
+    INSTANCE_IN_STATE="false"
+  fi
+
+  state_port="$(state_get_string "$RESOLVED_INSTANCE_NAME" port)"
+  state_bind_host="$(state_get_string "$RESOLVED_INSTANCE_NAME" bind_host)"
+  state_tailscale_enable="$(state_get_string "$RESOLVED_INSTANCE_NAME" tailscale_enable)"
+  state_snippets_path="$(state_get_string "$RESOLVED_INSTANCE_NAME" snippets_path)"
+  state_password="$(porterminal_saved_password)"
+
+  RESOLVED_BIND_HOST="${CLI_BIND_HOST:-${state_bind_host:-$DEFAULT_BIND_HOST}}"
+  RESOLVED_TAILSCALE_ENABLE="${CLI_TAILSCALE_ENABLE:-${state_tailscale_enable:-$DEFAULT_TAILSCALE_ENABLE}}"
+  RESOLVED_PORT="${CLI_PORT:-${state_port:-$DEFAULT_PORTERMINAL_PORT}}"
+  RESOLVED_SNIPPETS_PATH="${CLI_SNIPPETS_PATH:-${state_snippets_path:-${DATA_ROOT}/porterminal-snippets.json}}"
+  CLI_PASSWORD="${CLI_PASSWORD:-$state_password}"
+
+  if [[ -n "$RESOLVED_PORT" ]] && { ! [[ "$RESOLVED_PORT" =~ ^[0-9]+$ ]] || (( RESOLVED_PORT <= 0 || RESOLVED_PORT > 65535 )); }; then
+    echo "Invalid port: $RESOLVED_PORT" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" != "true" && "$RESOLVED_TAILSCALE_ENABLE" != "false" ]]; then
+    echo "TAILSCALE_ENABLE must be true or false" >&2
+    exit 1
+  fi
+}
+
+porterminal_resolve_runner() {
+  local runner_path
+  if ! runner_path="$(command -v "$PORTERMINAL_COMMAND" 2>/dev/null)"; then
+    echo "Missing Porterminal command: $PORTERMINAL_COMMAND" >&2
+    echo "Install the localhost launcher with src/porterminal/install_on_localhost.sh." >&2
+    exit 1
+  fi
+  if [[ ! -x "$runner_path" ]]; then
+    echo "Porterminal command is not executable: $runner_path" >&2
+    exit 1
+  fi
+  RESOLVED_RUNNER_PATH="$runner_path"
+}
+
+porterminal_write_instance_definition() {
+  local instance_json
+  instance_json="$(jq -n \
+    --arg instance_name "$RESOLVED_INSTANCE_NAME" \
+    --arg bind_host "$RESOLVED_BIND_HOST" \
+    --arg port "$RESOLVED_PORT" \
+    --arg config_path "$RESOLVED_CONFIG_PATH" \
+    --arg snippets_path "$RESOLVED_SNIPPETS_PATH" \
+    --arg password "$CLI_PASSWORD" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg tailscale_path "$RESOLVED_TAILSCALE_PATH" \
+    --arg status "unknown" \
+    '{instance_name: $instance_name, bind_host: $bind_host, port: ($port | tonumber), config_path: $config_path, snippets_path: $snippets_path, tailscale_enable: $tailscale_enable, tailscale_path: $tailscale_path, status: $status}
+     + (if $password == "" then {} else {password: $password} end)')"
+  state_put_instance_json "$RESOLVED_INSTANCE_NAME" "$instance_json"
+}
+
+porterminal_render_status() {
+  local pid="$1"
+  local observed_status="$2"
+  local target="http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  local route_present="no"
+  local route_match="no"
+  local url=""
+  local started_at_pretty=""
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    route_present="yes"
+  fi
+  if recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "$target"; then
+    route_match="yes"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    url="$(find_tailscale_url || true)"
+  fi
+  if [[ "$observed_status" == "running" ]]; then
+    started_at_pretty="$(format_started_at "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)")"
+  fi
+  local stored_password
+  stored_password="$(state_get_string "$RESOLVED_INSTANCE_NAME" password)"
+
+  echo "${C_BOLD}dev_stack porterminal status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "$observed_status") ${C_BOLD}${observed_status}${C_RESET}"
+  echo "  bind       ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  echo "  pid        ${pid:-<none>}"
+  echo "  config     ${RESOLVED_CONFIG_PATH}"
+  echo "  snippets   ${RESOLVED_SNIPPETS_PATH}"
+  echo "  log        ${RESOLVED_LOG_FILE}"
+  echo "  tailscale  $(format_yes_no "$RESOLVED_TAILSCALE_ENABLE")  path=${RESOLVED_TAILSCALE_PATH}"
+  echo "  route      present=${route_present}  backend_match=${route_match}"
+  if [[ -n "$url" ]]; then
+    echo "  url        ${C_CYAN}${url}${C_RESET}"
+  fi
+  if [[ -n "$stored_password" ]]; then
+    echo "  password   ${stored_password}"
+  fi
+  if [[ -n "$started_at_pretty" ]]; then
+    echo "  running    since ${started_at_pretty}"
+  fi
+}
+
+porterminal_render_not_found() {
+  echo "${C_BOLD}dev_stack porterminal status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "not_found") ${C_BOLD}not_found${C_RESET}"
+  echo "  service    ${C_DIM}not managed${C_RESET}"
+  echo "  path       ${RESOLVED_TAILSCALE_PATH}"
+}
+
+porterminal_health_ok() {
+  curl -fsS "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}/health" 2>/dev/null \
+    | jq -e '.status == "healthy" and has("sessions")' >/dev/null 2>&1
+}
+
+porterminal_reconcile_status() {
+  local recorded_pid
+  local pid_alive="false"
+  local listener_alive="false"
+  local health_ok="false"
+  local route_ok="false"
+  local observed_status="stopped"
+  local tailscale_url_json="null"
+  local started_at_json
+  local should_persist="false"
+
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$recorded_pid"; then
+    pid_alive="true"
+  fi
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    listener_alive="true"
+  fi
+  if [[ "$listener_alive" == "true" ]] && porterminal_health_ok; then
+    health_ok="true"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    route_ok="true"
+    tailscale_url_json="$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')"
+  fi
+
+  if [[ "$pid_alive" == "true" && "$listener_alive" == "true" && "$health_ok" == "true" ]]; then
+    observed_status="running"
+  elif [[ "$pid_alive" == "false" && "$listener_alive" == "false" ]]; then
+    observed_status="stopped"
+  else
+    observed_status="drifted"
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" && "$route_ok" == "false" && "$observed_status" == "running" ]]; then
+    observed_status="drifted"
+  fi
+
+  if [[ "$INSTANCE_IN_STATE" == "true" || "$pid_alive" == "true" || "$listener_alive" == "true" || "$route_ok" == "true" ]]; then
+    should_persist="true"
+  fi
+
+  if [[ "$should_persist" != "true" ]]; then
+    porterminal_render_not_found
+    return
+  fi
+
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    porterminal_write_instance_definition
+    INSTANCE_IN_STATE="true"
+  fi
+  started_at_json="$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$observed_status" \
+    "${recorded_pid:-null}" \
+    "${RESOLVED_PORT:-null}" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$tailscale_url_json" \
+    "$started_at_json"
+
+  porterminal_render_status "$recorded_pid" "$observed_status"
+}
+
+porterminal_prepare_files() {
+  mkdir -p "$STATE_DIR" "$(dirname "$RESOLVED_SNIPPETS_PATH")"
+  if [[ ! -s "$RESOLVED_SNIPPETS_PATH" ]]; then
+    printf '{\n  "snippets": []\n}\n' > "$RESOLVED_SNIPPETS_PATH"
+  fi
+
+  mkdir -p "$(dirname "$RESOLVED_CONFIG_PATH")"
+}
+
+porterminal_start() {
+  require_cmd jq
+  require_cmd ss
+  require_cmd curl
+  require_cmd setsid
+  porterminal_resolve_runner
+
+  local recorded_pid
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if [[ "$INSTANCE_IN_STATE" == "true" ]] && process_is_alive "$recorded_pid"; then
+    echo "porterminal is already running with pid ${recorded_pid} on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}." >&2
+    echo "See: ${PORTERMINAL_CLI} help start" >&2
+    exit 1
+  fi
+
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    echo "Port ${RESOLVED_PORT} is already in use" >&2
+    echo "See: ${PORTERMINAL_CLI} help start" >&2
+    exit 1
+  fi
+
+  porterminal_prepare_files
+  if [[ -z "$CLI_PASSWORD" ]]; then
+    CLI_PASSWORD="$(generate_instance_password)"
+  fi
+  porterminal_write_instance_definition
+  porterminal_save_password "$CLI_PASSWORD"
+  INSTANCE_IN_STATE="true"
+  ensure_no_route_collision
+
+  local start_cmd=(
+    "$RESOLVED_RUNNER_PATH"
+    --host "$RESOLVED_BIND_HOST"
+    --port "$RESOLVED_PORT"
+    --snippets "$RESOLVED_SNIPPETS_PATH"
+    --password-stdin
+  )
+  printf '%s\n' "$CLI_PASSWORD" \
+    | PORTERMINAL_CONFIG_PATH="$RESOLVED_CONFIG_PATH" \
+      setsid nohup "${start_cmd[@]}" >"$RESOLVED_LOG_FILE" 2>&1 &
+  local pid=$!
+  sleep 3
+
+  if ! process_is_alive "$pid" || ! porterminal_health_ok; then
+    echo "porterminal failed to start. Check $RESOLVED_LOG_FILE" >&2
+    echo "See: ${PORTERMINAL_CLI} help start" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    if ! configure_tailscale_route; then
+      state_merge_runtime \
+        "$RESOLVED_INSTANCE_NAME" \
+        "drifted" \
+        "$pid" \
+        "$RESOLVED_PORT" \
+        "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+        "null" \
+        "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+      echo "porterminal started locally on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}, but Tailscale Serve configuration failed." >&2
+      echo "See: ${PORTERMINAL_CLI} help start" >&2
+      exit 1
+    fi
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "running" \
+    "$pid" \
+    "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; else printf 'null'; fi)" \
+    "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+
+  echo "porterminal started."
+  echo "  local: http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    echo "  tailscale: $(find_tailscale_url || true)"
+  else
+    echo "  tailscale: disabled"
+  fi
+
+  porterminal_reconcile_status
+}
+
+porterminal_stop() {
+  local pid
+  local local_stopped="true"
+  local tailscale_cleared="true"
+  local final_status="stopped"
+
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "porterminal is not managed." >&2
+    echo "See: ${PORTERMINAL_CLI} help stop" >&2
+    exit 1
+  fi
+
+  pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$pid"; then
+    kill -- "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
+    sleep 1
+    if process_is_alive "$pid" || pgrep -g "$pid" >/dev/null 2>&1; then
+      local_stopped="false"
+    fi
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    if recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+      if ! remove_tailscale_route; then
+        tailscale_cleared="false"
+      fi
+    else
+      echo "Refusing to remove Tailscale route ${RESOLVED_TAILSCALE_PATH}: backend does not match porterminal target." >&2
+      tailscale_cleared="false"
+    fi
+  fi
+
+  if [[ "$local_stopped" != "true" || "$tailscale_cleared" != "true" ]]; then
+    final_status="drifted"
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$final_status" \
+    "$(if [[ "$local_stopped" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$pid" '$value|tonumber'; fi)" \
+    "${RESOLVED_PORT:-null}" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$tailscale_cleared" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; fi)" \
+    "$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+
+  porterminal_reconcile_status
+}
+
+porterminal_clean() {
+  porterminal_reconcile_status >/dev/null || true
+  if [[ "$(state_get_string "$RESOLVED_INSTANCE_NAME" status)" == "stopped" ]]; then
+    state_apply_jq \
+      '(.credentials.porterminal.password // .instances[$name].password // "") as $password
+       | del(.instances[$name])
+       | if $password != "" then
+           .credentials.porterminal = {password: $password}
+         else . end' \
+      --arg name "$RESOLVED_INSTANCE_NAME"
+    echo "Removed stopped porterminal service from state; saved credential was preserved."
+  else
+    echo "No stopped porterminal service to remove from state."
+  fi
+}
+
+porterminal_main() {
+  parse_porterminal_args "$@"
+  ensure_state
+  porterminal_resolve_config
+
+  case "$COMMAND" in
+    start)
+      porterminal_start
+      ;;
+    stop)
+      porterminal_stop
+      ;;
+    status)
+      porterminal_reconcile_status
+      ;;
+    restart)
+      if [[ "$INSTANCE_IN_STATE" == "true" ]]; then
+        porterminal_stop
+      fi
+      porterminal_start
+      ;;
+    clean)
+      porterminal_clean
+      ;;
+    *)
+      echo "Unknown command: $COMMAND" >&2
+      porterminal_usage
+      exit 1
+      ;;
+  esac
+}
+
+go2rtc_show_command_help() {
+  go2rtc_usage
+}
+
+parse_go2rtc_args() {
+  if [[ $# -lt 1 ]]; then
+    go2rtc_usage
+    exit 1
+  fi
+
+  case "$1" in
+    help|-h|--help)
+      go2rtc_show_command_help
+      exit 0
+      ;;
+  esac
+
+  COMMAND="$1"
+  shift
+
+  if [[ "$COMMAND" == "password" ]]; then
+    if [[ "${1:-}" != "reset" || $# -ne 1 ]]; then
+      echo "Usage: ${GO2RTC_CLI} password reset" >&2
+      exit 1
+    fi
+    COMMAND="password-reset"
+    shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        if [[ "$COMMAND" != "status" ]]; then
+          echo "--json is only supported with go2rtc status." >&2
+          exit 1
+        fi
+        GO2RTC_JSON_MODE="true"
+        shift
+        ;;
+      -f|--follow)
+        if [[ "$COMMAND" != "logs" ]]; then
+          echo "$1 is only supported with go2rtc logs." >&2
+          exit 1
+        fi
+        GO2RTC_LOG_FOLLOW="true"
+        shift
+        ;;
+      --tail)
+        if [[ "$COMMAND" != "logs" ]]; then
+          echo "--tail is only supported with go2rtc logs." >&2
+          exit 1
+        fi
+        if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+          echo "--tail requires a non-negative integer." >&2
+          exit 1
+        fi
+        GO2RTC_LOG_TAIL="$2"
+        shift 2
+        ;;
+      --tailscale-no-serve)
+        if [[ "$COMMAND" == "logs" ]]; then
+          echo "--tailscale-no-serve is not supported with go2rtc logs." >&2
+          exit 1
+        fi
+        CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      -h|--help|help)
+        go2rtc_show_command_help
+        exit 0
+        ;;
+      *)
+        echo "Unknown go2rtc option: $1" >&2
+        go2rtc_usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+go2rtc_resolve_config() {
+  local state_tailscale_enable=""
+  if state_instance_exists "$GO2RTC_INSTANCE_NAME"; then
+    state_tailscale_enable="$(state_get_string "$GO2RTC_INSTANCE_NAME" tailscale_enable)"
+  fi
+  RESOLVED_INSTANCE_NAME="$GO2RTC_INSTANCE_NAME"
+  RESOLVED_BIND_HOST="$GO2RTC_BIND_HOST"
+  RESOLVED_PORT="$GO2RTC_API_PORT"
+  RESOLVED_TAILSCALE_PATH="$GO2RTC_TAILSCALE_PATH"
+  RESOLVED_TAILSCALE_ENABLE="${CLI_TAILSCALE_ENABLE:-${state_tailscale_enable:-$DEFAULT_TAILSCALE_ENABLE}}"
+}
+
+go2rtc_write_manager_config() {
+  local instance_json
+  instance_json="$(jq -n \
+    --arg instance_name "$GO2RTC_INSTANCE_NAME" \
+    --arg bind_host "$GO2RTC_BIND_HOST" \
+    --arg port "$GO2RTC_API_PORT" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg tailscale_path "$GO2RTC_TAILSCALE_PATH" \
+    '{
+      instance_name: $instance_name,
+      bind_host: $bind_host,
+      port: ($port | tonumber),
+      tailscale_enable: $tailscale_enable,
+      tailscale_path: $tailscale_path
+    }')"
+  state_put_instance_json "$GO2RTC_INSTANCE_NAME" "$instance_json"
+}
+
+go2rtc_saved_username() {
+  jq -r '.credentials.go2rtc.username // empty' "$STATE_FILE"
+}
+
+go2rtc_saved_password() {
+  jq -r '.credentials.go2rtc.password // empty' "$STATE_FILE"
+}
+
+go2rtc_save_credential() {
+  local password="$1"
+  state_apply_jq \
+    '.credentials.go2rtc = {username: $username, password: $password}' \
+    --arg username "$GO2RTC_AUTH_USERNAME" \
+    --arg password "$password"
+}
+
+go2rtc_write_auth_env() {
+  local username="$1"
+  local password="$2"
+  local auth_dir
+  local tmp_file
+  auth_dir="$(dirname "$GO2RTC_AUTH_ENV_FILE")"
+  mkdir -p "$auth_dir"
+  tmp_file="$(mktemp "${auth_dir}/go2rtc-auth.env.tmp.XXXXXX")"
+  chmod 600 "$tmp_file"
+  printf 'GO2RTC_API_USERNAME=%s\nGO2RTC_API_PASSWORD=%s\n' \
+    "$username" "$password" > "$tmp_file"
+  mv "$tmp_file" "$GO2RTC_AUTH_ENV_FILE"
+  chmod 600 "$GO2RTC_AUTH_ENV_FILE"
+}
+
+go2rtc_ensure_credential() {
+  local username
+  local password
+  GO2RTC_CREDENTIAL_CREATED="false"
+  username="$(go2rtc_saved_username)"
+  password="$(go2rtc_saved_password)"
+  if [[ -z "$username" || -z "$password" ]]; then
+    require_cmd openssl
+    password="$(generate_instance_password)"
+    go2rtc_save_credential "$password"
+    username="$GO2RTC_AUTH_USERNAME"
+    GO2RTC_CREDENTIAL_CREATED="true"
+  fi
+  go2rtc_write_auth_env "$username" "$password"
+}
+
+go2rtc_video_available() {
+  [[ -e "$GO2RTC_BRIO_DEVICE" ]]
+}
+
+go2rtc_sound_available() {
+  [[ -d "$GO2RTC_SOUND_DEVICE" ]]
+}
+
+go2rtc_webcam_available() {
+  go2rtc_video_available && go2rtc_sound_available
+}
+
+go2rtc_compose() {
+  local compose_args=(
+    compose
+    --project-directory "$GO2RTC_DIR"
+    -f "$GO2RTC_COMPOSE_FILE"
+  )
+  if go2rtc_webcam_available && [[ -f "$GO2RTC_WEBCAM_COMPOSE_FILE" ]]; then
+    compose_args+=(-f "$GO2RTC_WEBCAM_COMPOSE_FILE")
+  fi
+  GO2RTC_AUTH_ENV_FILE="$GO2RTC_AUTH_ENV_FILE" \
+  GO2RTC_STREAM_ENV_FILE="$GO2RTC_ENV_FILE" \
+  GO2RTC_VIDEO_DEVICE="$GO2RTC_BRIO_DEVICE" \
+  GO2RTC_SOUND_DEVICE="$GO2RTC_SOUND_DEVICE" \
+  docker "${compose_args[@]}" "$@"
+}
+
+go2rtc_require_compose() {
+  require_cmd docker
+  if [[ ! -f "$GO2RTC_COMPOSE_FILE" ]]; then
+    echo "Missing go2rtc Compose file: $GO2RTC_COMPOSE_FILE" >&2
+    exit 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose is unavailable." >&2
+    exit 1
+  fi
+}
+
+go2rtc_validate_start() {
+  go2rtc_require_compose
+  require_cmd curl
+  if [[ ! -f "$GO2RTC_CONFIG_FILE" ]]; then
+    echo "Missing go2rtc configuration: $GO2RTC_CONFIG_FILE" >&2
+    exit 1
+  fi
+  if [[ ! -f "$GO2RTC_ENV_FILE" ]]; then
+    echo "Missing go2rtc environment file: $GO2RTC_ENV_FILE" >&2
+    exit 1
+  fi
+  if [[ ! -f "$GO2RTC_AUTH_ENV_FILE" ]]; then
+    echo "Missing go2rtc authentication environment file: $GO2RTC_AUTH_ENV_FILE" >&2
+    exit 1
+  fi
+  if ! go2rtc_compose config -q >/dev/null 2>&1; then
+    echo "The go2rtc Docker Compose deployment is invalid." >&2
+    exit 1
+  fi
+}
+
+go2rtc_set_unknown() {
+  GO2RTC_OBSERVED_STATUS="unknown"
+  GO2RTC_OBSERVED_SUMMARY="$1"
+  GO2RTC_OBSERVED_HEALTH_MESSAGE="$1"
+}
+
+go2rtc_route_target() {
+  printf 'http://%s:%s\n' "$GO2RTC_BIND_HOST" "$GO2RTC_API_PORT"
+}
+
+go2rtc_reconcile_tailscale_route() {
+  local target
+  target="$(go2rtc_route_target)"
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    if tailscale_route_present "$GO2RTC_TAILSCALE_PATH" \
+      && ! recorded_target_matches "$GO2RTC_TAILSCALE_PATH" "$target"; then
+      echo "Route collision: live Tailscale Serve route already exists for ${GO2RTC_TAILSCALE_PATH}." >&2
+      return 1
+    fi
+    if ! recorded_target_matches "$GO2RTC_TAILSCALE_PATH" "$target"; then
+      configure_tailscale_route
+    fi
+    return
+  fi
+
+  if tailscale_route_present "$GO2RTC_TAILSCALE_PATH"; then
+    if ! recorded_target_matches "$GO2RTC_TAILSCALE_PATH" "$target"; then
+      echo "Refusing to remove ${GO2RTC_TAILSCALE_PATH}: its backend is not owned by go2rtc." >&2
+      return 1
+    fi
+    remove_tailscale_route
+  fi
+}
+
+go2rtc_remove_tailscale_route() {
+  local target
+  target="$(go2rtc_route_target)"
+  if ! tailscale_route_present "$GO2RTC_TAILSCALE_PATH"; then
+    return
+  fi
+  if ! recorded_target_matches "$GO2RTC_TAILSCALE_PATH" "$target"; then
+    echo "Refusing to remove ${GO2RTC_TAILSCALE_PATH}: its backend is not owned by go2rtc." >&2
+    return 1
+  fi
+  remove_tailscale_route
+}
+
+go2rtc_api_health_ok() {
+  local username
+  local password
+  username="$(go2rtc_saved_username)"
+  password="$(go2rtc_saved_password)"
+  [[ -n "$username" && -n "$password" ]] || return 1
+  curl -fsS --max-time 2 \
+    --config <(printf 'user = "%s:%s"\n' "$username" "$password") \
+    "http://${GO2RTC_BIND_HOST}:${GO2RTC_API_PORT}/" >/dev/null 2>&1
+}
+
+go2rtc_observe() {
+  local ps_output=""
+  local container_json=""
+  local container_state=""
+  local started_at=""
+  local started_epoch=""
+  local now_epoch=""
+
+  GO2RTC_OBSERVED_STATUS="unknown"
+  GO2RTC_OBSERVED_SUMMARY="go2rtc status is unavailable."
+  GO2RTC_OBSERVED_HEALTH_MESSAGE="$GO2RTC_OBSERVED_SUMMARY"
+  GO2RTC_OBSERVED_CONTAINER_ID=""
+  GO2RTC_OBSERVED_CONTAINER_STATE=""
+  GO2RTC_OBSERVED_UPTIME_SECONDS=""
+  GO2RTC_OBSERVED_ROUTE_PRESENT="false"
+  GO2RTC_OBSERVED_ROUTE_MATCHES="false"
+  GO2RTC_OBSERVED_URL=""
+  GO2RTC_OBSERVED_LOCAL_HEALTH="false"
+  GO2RTC_OBSERVED_AUTH_CONFIGURED="false"
+
+  if [[ -n "$(go2rtc_saved_username)" && -n "$(go2rtc_saved_password)" ]]; then
+    GO2RTC_OBSERVED_AUTH_CONFIGURED="true"
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    go2rtc_set_unknown "Docker is not installed or is not on PATH."
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    go2rtc_set_unknown "jq is required to interpret Docker Compose status."
+    return
+  fi
+  if [[ ! -f "$GO2RTC_COMPOSE_FILE" ]]; then
+    go2rtc_set_unknown "The go2rtc Compose file is missing."
+    return
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    go2rtc_set_unknown "Docker Compose is unavailable."
+    return
+  fi
+  if ! ps_output="$(go2rtc_compose ps -a --format json "$GO2RTC_SERVICE_NAME" 2>/dev/null)"; then
+    go2rtc_set_unknown "Docker Compose status could not be read."
+    return
+  fi
+
+  if command -v tailscale >/dev/null 2>&1; then
+    if tailscale_route_present "$GO2RTC_TAILSCALE_PATH"; then
+      GO2RTC_OBSERVED_ROUTE_PRESENT="true"
+    fi
+    if recorded_target_matches "$GO2RTC_TAILSCALE_PATH" "$(go2rtc_route_target)"; then
+      GO2RTC_OBSERVED_ROUTE_MATCHES="true"
+      GO2RTC_OBSERVED_URL="$(find_tailscale_url || true)"
+    fi
+  fi
+
+  if [[ -n "$ps_output" ]]; then
+    if ! container_json="$(jq -c '
+      if type == "array" then (.[0] // empty)
+      elif type == "object" then .
+      else empty
+      end
+    ' <<<"$ps_output" 2>/dev/null)"; then
+      go2rtc_set_unknown "Docker Compose returned an invalid status response."
+      return
+    fi
+  fi
+
+  if [[ -z "$container_json" ]]; then
+    GO2RTC_OBSERVED_STATUS="not_found"
+    if go2rtc_webcam_available; then
+      GO2RTC_OBSERVED_SUMMARY="No go2rtc Docker Compose container exists."
+      GO2RTC_OBSERVED_HEALTH_MESSAGE="No Compose container is present. The configured Brio webcam is available."
+    else
+      GO2RTC_OBSERVED_SUMMARY="No go2rtc container exists. The optional Brio webcam is disconnected and will be skipped on start."
+      GO2RTC_OBSERVED_HEALTH_MESSAGE="No Compose container is present. Reolink streams can start without the optional Brio webcam."
+    fi
+    return
+  fi
+
+  container_state="$(jq -r '.State // empty' <<<"$container_json" 2>/dev/null)"
+  GO2RTC_OBSERVED_CONTAINER_STATE="$container_state"
+  GO2RTC_OBSERVED_CONTAINER_ID="$(jq -r '.ID // empty' <<<"$container_json" 2>/dev/null)"
+  if [[ -z "$container_state" ]]; then
+    go2rtc_set_unknown "Docker Compose did not report a container state."
+    return
+  fi
+
+  if [[ "$container_state" != "running" ]]; then
+    GO2RTC_OBSERVED_STATUS="stopped"
+    GO2RTC_OBSERVED_SUMMARY="The go2rtc container exists but is stopped."
+    GO2RTC_OBSERVED_HEALTH_MESSAGE="Docker Compose reports container state ${container_state}."
+    return
+  fi
+
+  if command -v curl >/dev/null 2>&1 && go2rtc_api_health_ok; then
+    GO2RTC_OBSERVED_LOCAL_HEALTH="true"
+    GO2RTC_OBSERVED_STATUS="running"
+    GO2RTC_OBSERVED_SUMMARY="The go2rtc container and local WebUI/API are healthy."
+    GO2RTC_OBSERVED_HEALTH_MESSAGE="Container state and local HTTP health check agree."
+  else
+    GO2RTC_OBSERVED_STATUS="drifted"
+    if [[ "$GO2RTC_OBSERVED_AUTH_CONFIGURED" == "true" ]]; then
+      GO2RTC_OBSERVED_SUMMARY="The go2rtc container is running, but its authenticated WebUI/API health check failed."
+      GO2RTC_OBSERVED_HEALTH_MESSAGE="Container is running but the authenticated local HTTP health check failed."
+    else
+      GO2RTC_OBSERVED_SUMMARY="The go2rtc container is running without a managed WebUI/API credential."
+      GO2RTC_OBSERVED_HEALTH_MESSAGE="Generate and install a credential with go2rtc password reset."
+    fi
+  fi
+
+  if [[ "$GO2RTC_OBSERVED_STATUS" == "running" && "$RESOLVED_TAILSCALE_ENABLE" == "true" \
+    && "$GO2RTC_OBSERVED_ROUTE_MATCHES" != "true" ]]; then
+    GO2RTC_OBSERVED_STATUS="drifted"
+    GO2RTC_OBSERVED_SUMMARY="go2rtc is healthy locally, but its Tailscale Serve route needs attention."
+    GO2RTC_OBSERVED_HEALTH_MESSAGE="Local health passed but the expected Tailscale route is missing or mismatched."
+  elif [[ "$GO2RTC_OBSERVED_STATUS" == "running" && "$RESOLVED_TAILSCALE_ENABLE" != "true" \
+    && "$GO2RTC_OBSERVED_ROUTE_PRESENT" == "true" ]]; then
+    GO2RTC_OBSERVED_STATUS="drifted"
+    GO2RTC_OBSERVED_SUMMARY="go2rtc is healthy locally, but an unexpected Tailscale Serve route is present."
+    GO2RTC_OBSERVED_HEALTH_MESSAGE="Tailscale publication is disabled but the route is still present."
+  fi
+
+  if [[ -n "$GO2RTC_OBSERVED_CONTAINER_ID" ]]; then
+    started_at="$(docker inspect --format '{{.State.StartedAt}}' "$GO2RTC_OBSERVED_CONTAINER_ID" 2>/dev/null || true)"
+    started_epoch="$(date -d "$started_at" +%s 2>/dev/null || true)"
+    now_epoch="$(date +%s)"
+    if [[ "$started_epoch" =~ ^[0-9]+$ ]] && (( now_epoch >= started_epoch )); then
+      GO2RTC_OBSERVED_UPTIME_SECONDS="$((now_epoch - started_epoch))"
+    fi
+  fi
+}
+
+go2rtc_render_status_json() {
+  local uptime_json="null"
+  local health_state="$GO2RTC_OBSERVED_STATUS"
+  local webcam_available="false"
+  local video_available="false"
+  local stream_env_available="false"
+  local sound_available="false"
+  if [[ "$GO2RTC_OBSERVED_UPTIME_SECONDS" =~ ^[0-9]+$ ]]; then
+    uptime_json="$GO2RTC_OBSERVED_UPTIME_SECONDS"
+  fi
+  if [[ "$GO2RTC_OBSERVED_STATUS" == "running" ]]; then
+    health_state="healthy"
+  elif [[ "$GO2RTC_OBSERVED_STATUS" == "drifted" ]]; then
+    health_state="degraded"
+  fi
+  if go2rtc_webcam_available; then
+    webcam_available="true"
+  fi
+  if go2rtc_video_available; then
+    video_available="true"
+  fi
+  if [[ -f "$GO2RTC_ENV_FILE" ]]; then
+    stream_env_available="true"
+  fi
+  if [[ -d "$GO2RTC_SOUND_DEVICE" ]]; then
+    sound_available="true"
+  fi
+
+  jq -n \
+    --arg status "$GO2RTC_OBSERVED_STATUS" \
+    --arg summary "$GO2RTC_OBSERVED_SUMMARY" \
+    --arg bind_host "$GO2RTC_BIND_HOST" \
+    --arg port "$GO2RTC_API_PORT" \
+    --arg url "$GO2RTC_OBSERVED_URL" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg route_matches "$GO2RTC_OBSERVED_ROUTE_MATCHES" \
+    --arg route_path "$GO2RTC_TAILSCALE_PATH" \
+    --arg auth_configured "$GO2RTC_OBSERVED_AUTH_CONFIGURED" \
+    --arg auth_username "$GO2RTC_AUTH_USERNAME" \
+    --arg health_state "$health_state" \
+    --arg health_message "$GO2RTC_OBSERVED_HEALTH_MESSAGE" \
+    --arg compose_file "$GO2RTC_COMPOSE_FILE" \
+    --arg config_file "$GO2RTC_CONFIG_FILE" \
+    --arg stream_env_file "$GO2RTC_ENV_FILE" \
+    --arg stream_env_available "$stream_env_available" \
+    --arg video_device "$GO2RTC_BRIO_DEVICE" \
+    --arg webcam_available "$webcam_available" \
+    --arg video_available "$video_available" \
+    --arg sound_device "$GO2RTC_SOUND_DEVICE" \
+    --arg sound_available "$sound_available" \
+    --argjson uptime_seconds "$uptime_json" \
+    '{
+      id: "go2rtc",
+      name: "go2rtc",
+      description: "Local camera and RTSP/WebRTC gateway",
+      status: $status,
+      summary: $summary,
+      bind_host: $bind_host,
+      port: ($port | tonumber),
+      uptime_seconds: $uptime_seconds,
+      url: (if $url == "" then null else $url end),
+      route: {
+        enabled: ($tailscale_enable == "true"),
+        present: ($route_matches == "true"),
+        path: $route_path
+      },
+      credential: {
+        available: ($auth_configured == "true"),
+        username: $auth_username
+      },
+      health: {
+        state: $health_state,
+        message: $health_message
+      },
+      configuration: {
+        compose_file: $compose_file,
+        config_file: $config_file,
+        stream_env_file: {
+          path: $stream_env_file,
+          available: ($stream_env_available == "true")
+        },
+        webcam: {
+          optional: true,
+          enabled: ($webcam_available == "true"),
+          video_device: $video_device,
+          video_available: ($video_available == "true"),
+          sound_device: $sound_device,
+          sound_available: ($sound_available == "true"),
+          message: (
+            if $webcam_available == "true"
+            then "The configured Brio webcam overlay will be enabled."
+            else "The optional Brio webcam is disconnected; Reolink streams remain available."
+            end
+          )
+        },
+        streams: [
+          {
+            id: "brio",
+            description: "Optional local Brio webcam and microphone",
+            available: ($webcam_available == "true")
+          },
+          {
+            id: "reolink_main",
+            description: "Browser-compatible H.264 1080p Reolink stream",
+            available: ($stream_env_available == "true")
+          },
+          {
+            id: "reolink_main_4k_hevc",
+            description: "Original 4K HEVC Reolink stream",
+            available: ($stream_env_available == "true")
+          },
+          {
+            id: "reolink_sub",
+            description: "Reolink sub stream",
+            available: ($stream_env_available == "true")
+          }
+        ]
+      }
+    }'
+}
+
+go2rtc_render_status() {
+  local uptime=""
+  if [[ "$GO2RTC_OBSERVED_UPTIME_SECONDS" =~ ^[0-9]+$ ]]; then
+    uptime="${GO2RTC_OBSERVED_UPTIME_SECONDS}s"
+  fi
+
+  echo "${C_BOLD}dev_stack go2rtc status${C_RESET}"
+  echo "${C_BOLD}go2rtc${C_RESET} $(status_dot "$GO2RTC_OBSERVED_STATUS") ${C_BOLD}${GO2RTC_OBSERVED_STATUS}${C_RESET}"
+  echo "  compose    ${GO2RTC_COMPOSE_FILE}"
+  echo "  bind       ${GO2RTC_BIND_HOST}:${GO2RTC_API_PORT}"
+  echo "  tailscale  $(format_yes_no "$RESOLVED_TAILSCALE_ENABLE")  path=${GO2RTC_TAILSCALE_PATH}"
+  echo "  route      present=$(if [[ "$GO2RTC_OBSERVED_ROUTE_PRESENT" == "true" ]]; then printf 'yes'; else printf 'no'; fi)  backend_match=$(if [[ "$GO2RTC_OBSERVED_ROUTE_MATCHES" == "true" ]]; then printf 'yes'; else printf 'no'; fi)"
+  echo "  auth       basic  username=${GO2RTC_AUTH_USERNAME}  configured=$(if [[ "$GO2RTC_OBSERVED_AUTH_CONFIGURED" == "true" ]]; then printf 'yes'; else printf 'no'; fi)"
+  echo "  webcam     $(if go2rtc_webcam_available; then printf 'enabled'; else printf 'skipped (optional device unavailable)'; fi)"
+  if [[ -n "$GO2RTC_OBSERVED_URL" ]]; then
+    echo "  url        ${C_CYAN}${GO2RTC_OBSERVED_URL}${C_RESET}"
+  fi
+  if [[ -n "$uptime" ]]; then
+    echo "  uptime     ${uptime}"
+  fi
+  echo "  health     ${GO2RTC_OBSERVED_HEALTH_MESSAGE}"
+}
+
+go2rtc_status() {
+  require_cmd jq
+  go2rtc_observe
+  if [[ "$GO2RTC_JSON_MODE" == "true" ]]; then
+    go2rtc_render_status_json
+  else
+    go2rtc_render_status
+  fi
+}
+
+go2rtc_wait_for_status() {
+  local expected="$1"
+  local attempt
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    go2rtc_observe
+    if [[ "$GO2RTC_OBSERVED_STATUS" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+go2rtc_start() {
+  require_cmd jq
+  go2rtc_ensure_credential
+  go2rtc_observe
+  if [[ "$GO2RTC_CREDENTIAL_CREATED" != "true" \
+    && -n "$GO2RTC_OBSERVED_CONTAINER_ID" \
+    && "$GO2RTC_OBSERVED_LOCAL_HEALTH" == "true" ]]; then
+    go2rtc_write_manager_config
+    if ! go2rtc_reconcile_tailscale_route; then
+      echo "go2rtc is running locally, but Tailscale Serve configuration failed." >&2
+      exit 1
+    fi
+    go2rtc_observe
+    echo "go2rtc is already running; its Tailscale publication is reconciled."
+    go2rtc_render_status
+    return
+  fi
+
+  go2rtc_validate_start
+  go2rtc_write_manager_config
+  local up_args=(up -d)
+  if [[ "$GO2RTC_CREDENTIAL_CREATED" == "true" ]]; then
+    up_args+=(--force-recreate)
+  fi
+  if ! go2rtc_compose "${up_args[@]}" >/dev/null 2>&1; then
+    echo "go2rtc failed to start with Docker Compose." >&2
+    echo "Check: ${GO2RTC_CLI} logs --tail 100" >&2
+    exit 1
+  fi
+  if ! go2rtc_reconcile_tailscale_route; then
+    echo "go2rtc started locally, but Tailscale Serve configuration failed." >&2
+    exit 1
+  fi
+  if ! go2rtc_wait_for_status "running"; then
+    echo "go2rtc started, but it did not become healthy." >&2
+    go2rtc_render_status >&2
+    exit 1
+  fi
+  echo "go2rtc started."
+  go2rtc_render_status
+}
+
+go2rtc_stop() {
+  require_cmd jq
+  go2rtc_require_compose
+  go2rtc_observe
+  case "$GO2RTC_OBSERVED_STATUS" in
+    not_found)
+      echo "go2rtc is not managed by Docker Compose." >&2
+      exit 1
+      ;;
+    unknown)
+      echo "Cannot stop go2rtc because its current status is unknown." >&2
+      exit 1
+      ;;
+  esac
+
+  if ! go2rtc_compose stop >/dev/null 2>&1; then
+    echo "go2rtc failed to stop with Docker Compose." >&2
+    exit 1
+  fi
+  if ! go2rtc_remove_tailscale_route; then
+    echo "go2rtc stopped, but its Tailscale Serve route could not be removed." >&2
+    exit 1
+  fi
+  if ! go2rtc_wait_for_status "stopped"; then
+    echo "go2rtc did not reach the stopped state." >&2
+    go2rtc_render_status >&2
+    exit 1
+  fi
+  echo "go2rtc stopped."
+  go2rtc_render_status
+}
+
+go2rtc_restart() {
+  require_cmd jq
+  go2rtc_ensure_credential
+  go2rtc_observe
+  case "$GO2RTC_OBSERVED_STATUS" in
+    unknown)
+      echo "Cannot restart go2rtc because its current status is unknown." >&2
+      exit 1
+      ;;
+    not_found)
+      go2rtc_start
+      return
+      ;;
+  esac
+
+  go2rtc_require_compose
+  local restart_args=(restart)
+  if [[ "$GO2RTC_CREDENTIAL_CREATED" == "true" ]]; then
+    restart_args=(up -d --force-recreate)
+  fi
+  if ! go2rtc_compose "${restart_args[@]}" >/dev/null 2>&1; then
+    echo "go2rtc failed to restart with Docker Compose." >&2
+    exit 1
+  fi
+  go2rtc_write_manager_config
+  if ! go2rtc_reconcile_tailscale_route; then
+    echo "go2rtc restarted locally, but Tailscale Serve configuration failed." >&2
+    exit 1
+  fi
+  if ! go2rtc_wait_for_status "running"; then
+    echo "go2rtc restarted, but it did not become healthy." >&2
+    go2rtc_render_status >&2
+    exit 1
+  fi
+  echo "go2rtc restarted."
+  go2rtc_render_status
+}
+
+go2rtc_publish() {
+  require_cmd jq
+  RESOLVED_TAILSCALE_ENABLE="true"
+  go2rtc_observe
+  if [[ "$GO2RTC_OBSERVED_CONTAINER_STATE" != "running" ]]; then
+    echo "Cannot publish go2rtc because its container is not running." >&2
+    exit 1
+  fi
+  go2rtc_write_manager_config
+  if ! go2rtc_reconcile_tailscale_route; then
+    echo "go2rtc is running locally, but Tailscale Serve configuration failed." >&2
+    exit 1
+  fi
+  go2rtc_observe
+  if [[ "$GO2RTC_OBSERVED_ROUTE_MATCHES" != "true" ]]; then
+    echo "The go2rtc Tailscale Serve route was not observed after publication." >&2
+    exit 1
+  fi
+  echo "go2rtc is published through Tailscale Serve."
+  go2rtc_render_status
+}
+
+go2rtc_unpublish() {
+  require_cmd jq
+  RESOLVED_TAILSCALE_ENABLE="false"
+  go2rtc_observe
+  if ! go2rtc_reconcile_tailscale_route; then
+    echo "The go2rtc Tailscale Serve route could not be removed safely." >&2
+    exit 1
+  fi
+  go2rtc_write_manager_config
+  go2rtc_observe
+  if [[ "$GO2RTC_OBSERVED_ROUTE_PRESENT" == "true" ]]; then
+    echo "The go2rtc Tailscale Serve route is still present." >&2
+    exit 1
+  fi
+  echo "go2rtc is no longer published through Tailscale Serve."
+  go2rtc_render_status
+}
+
+go2rtc_password_reset() {
+  require_cmd jq
+  require_cmd openssl
+  go2rtc_require_compose
+
+  go2rtc_observe
+  local was_running="false"
+  if [[ "$GO2RTC_OBSERVED_CONTAINER_STATE" == "running" ]]; then
+    was_running="true"
+  fi
+
+  local new_password
+  new_password="$(generate_instance_password)"
+  go2rtc_save_credential "$new_password"
+  go2rtc_write_auth_env "$GO2RTC_AUTH_USERNAME" "$new_password"
+  go2rtc_validate_start
+
+  if [[ "$was_running" == "true" ]]; then
+    if ! go2rtc_compose up -d --force-recreate >/dev/null 2>&1; then
+      echo "go2rtc authentication was updated, but the container could not be recreated." >&2
+      exit 1
+    fi
+    if ! go2rtc_reconcile_tailscale_route; then
+      echo "go2rtc authentication was updated, but Tailscale Serve reconciliation failed." >&2
+      exit 1
+    fi
+    if ! go2rtc_wait_for_status "running"; then
+      echo "go2rtc restarted, but its authenticated health check failed." >&2
+      go2rtc_render_status >&2
+      exit 1
+    fi
+  fi
+
+  echo "go2rtc WebUI/API password reset successfully."
+  echo "  username: ${GO2RTC_AUTH_USERNAME}"
+  echo "  password: ${new_password}"
+  echo "  saved: ${STATE_FILE} and ${GO2RTC_AUTH_ENV_FILE} (mode 0600)"
+}
+
+go2rtc_clean() {
+  require_cmd jq
+  go2rtc_require_compose
+  go2rtc_observe
+  case "$GO2RTC_OBSERVED_STATUS" in
+    not_found)
+      echo "No stopped go2rtc container to remove."
+      return
+      ;;
+    running|drifted)
+      echo "Refusing to clean go2rtc while its container is running." >&2
+      echo "Run '${GO2RTC_CLI} stop' first." >&2
+      exit 1
+      ;;
+    unknown)
+      echo "Cannot clean go2rtc because its current status is unknown." >&2
+      exit 1
+      ;;
+  esac
+
+  if ! go2rtc_remove_tailscale_route; then
+    echo "Cannot clean go2rtc while its Tailscale Serve route cannot be safely removed." >&2
+    exit 1
+  fi
+  if ! go2rtc_compose down >/dev/null 2>&1; then
+    echo "Failed to remove the stopped go2rtc container." >&2
+    exit 1
+  fi
+  if ! go2rtc_wait_for_status "not_found"; then
+    echo "The stopped go2rtc container was not fully removed." >&2
+    go2rtc_render_status >&2
+    exit 1
+  fi
+  state_apply_jq 'del(.instances[$name])' --arg name "$GO2RTC_INSTANCE_NAME"
+  echo "Removed the stopped go2rtc container; configuration and image were preserved."
+}
+
+go2rtc_logs() {
+  go2rtc_require_compose
+  local log_args=(logs)
+  if [[ "$GO2RTC_LOG_FOLLOW" == "true" ]]; then
+    log_args+=(--follow)
+  fi
+  if [[ -n "$GO2RTC_LOG_TAIL" ]]; then
+    log_args+=(--tail "$GO2RTC_LOG_TAIL")
+  fi
+  log_args+=("$GO2RTC_SERVICE_NAME")
+  go2rtc_compose "${log_args[@]}"
+}
+
+go2rtc_main() {
+  parse_go2rtc_args "$@"
+  ensure_state
+  go2rtc_resolve_config
+  case "$COMMAND" in
+    start) go2rtc_start ;;
+    stop) go2rtc_stop ;;
+    status) go2rtc_status ;;
+    restart) go2rtc_restart ;;
+    clean) go2rtc_clean ;;
+    publish) go2rtc_publish ;;
+    unpublish) go2rtc_unpublish ;;
+    logs) go2rtc_logs ;;
+    password-reset) go2rtc_password_reset ;;
+    *)
+      echo "Unknown go2rtc command: $COMMAND" >&2
+      go2rtc_usage
+      exit 1
+      ;;
+  esac
+}
+
+www_usage() {
+  cat <<EOF
+www service
+
+Serve the dev_stack status and limited-operations dashboard on localhost and, by default, on your tailnet.
+
+Usage:
+  ${WWW_CLI} <start|stop|status|restart|clean> [options]
+
+Options:
+  --port <port>            Local bind port. Default: reuses state or ${DEFAULT_WWW_PORT}.
+  --bind-host <host>       Loopback bind address. Supported: 127.0.0.1, localhost, ::1.
+                           Default: ${DEFAULT_BIND_HOST}.
+  --tailscale-no-serve     Do not publish the dashboard through Tailscale Serve.
+  --help                   Show this help.
+
+API boundary:
+  Status polling may execute only '${SCRIPT_NAME} status --json'.
+  Credential reveal may execute only the fixed '${SCRIPT_NAME} credentials show ... --json' allowlist.
+  File Browser controls may execute only '${SCRIPT_NAME} filebrowser start|stop|restart|clean'.
+  Porterminal controls may execute only '${SCRIPT_NAME} porterminal start|stop|restart|clean'.
+  go2rtc controls may execute only '${SCRIPT_NAME} go2rtc start|stop|restart|clean'.
+  Code Server controls may execute only per-instance '${SCRIPT_NAME} code-server start|stop|restart --instance-name <name>' and global '${SCRIPT_NAME} code-server clean'.
+  No other state-changing dev_stack service commands are exposed over HTTP.
+
+Authentication:
+  Configure the dashboard master password first with '${ADMIN_CLI} password reset'.
+  The login session protects the page, status API, credential reveal API, and all service controls.
+
+Paths:
+  State: ${STATE_FILE:-${STATE_ROOT}/state-www.json}
+  Log:   ${DEFAULT_LOG_DIR}/dev-stack-www.log
+  Route: ${WWW_TAILSCALE_PATH}
+EOF
+}
+
+parse_www_args() {
+  if [[ $# -lt 1 ]]; then
+    www_usage
+    exit 1
+  fi
+
+  case "$1" in
+    help|-h|--help)
+      www_usage
+      exit 0
+      ;;
+  esac
+
+  COMMAND="$1"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        if [[ $# -lt 2 ]]; then
+          echo "--port requires a value" >&2
+          exit 1
+        fi
+        CLI_PORT="$2"
+        shift 2
+        ;;
+      --bind-host)
+        if [[ $# -lt 2 ]]; then
+          echo "--bind-host requires a value" >&2
+          exit 1
+        fi
+        CLI_BIND_HOST="$2"
+        shift 2
+        ;;
+      --tailscale-no-serve)
+        CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      -h|--help|help)
+        www_usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        www_usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+www_resolve_config() {
+  local state_port
+  local state_bind_host
+  local state_tailscale_enable
+
+  RESOLVED_INSTANCE_NAME="$WWW_INSTANCE_NAME"
+  RESOLVED_TAILSCALE_PATH="$WWW_TAILSCALE_PATH"
+  RESOLVED_LOG_FILE="${DEFAULT_LOG_DIR}/dev-stack-www.log"
+
+  if state_instance_exists "$RESOLVED_INSTANCE_NAME"; then
+    INSTANCE_IN_STATE="true"
+  else
+    INSTANCE_IN_STATE="false"
+  fi
+
+  state_port="$(state_get_string "$RESOLVED_INSTANCE_NAME" port)"
+  state_bind_host="$(state_get_string "$RESOLVED_INSTANCE_NAME" bind_host)"
+  state_tailscale_enable="$(state_get_string "$RESOLVED_INSTANCE_NAME" tailscale_enable)"
+  RESOLVED_PORT="${CLI_PORT:-${state_port:-$DEFAULT_WWW_PORT}}"
+  RESOLVED_BIND_HOST="${CLI_BIND_HOST:-${state_bind_host:-$DEFAULT_BIND_HOST}}"
+  RESOLVED_TAILSCALE_ENABLE="${CLI_TAILSCALE_ENABLE:-${state_tailscale_enable:-$DEFAULT_TAILSCALE_ENABLE}}"
+
+  if ! [[ "$RESOLVED_PORT" =~ ^[0-9]+$ ]] || (( RESOLVED_PORT <= 0 || RESOLVED_PORT > 65535 )); then
+    echo "Invalid port: $RESOLVED_PORT" >&2
+    exit 1
+  fi
+  case "$RESOLVED_BIND_HOST" in
+    127.0.0.1|localhost|::1) ;;
+    *)
+      echo "Phase 1 www only supports a loopback bind host." >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" != "true" && "$RESOLVED_TAILSCALE_ENABLE" != "false" ]]; then
+    echo "TAILSCALE_ENABLE must be true or false" >&2
+    exit 1
+  fi
+}
+
+www_write_instance_definition() {
+  local instance_json
+  instance_json="$(jq -n \
+    --arg instance_name "$RESOLVED_INSTANCE_NAME" \
+    --arg bind_host "$RESOLVED_BIND_HOST" \
+    --arg port "$RESOLVED_PORT" \
+    --arg server_path "$WWW_SERVER_PATH" \
+    --arg static_dir "$WWW_STATIC_DIR" \
+    --arg tailscale_enable "$RESOLVED_TAILSCALE_ENABLE" \
+    --arg tailscale_path "$RESOLVED_TAILSCALE_PATH" \
+    '{instance_name: $instance_name, bind_host: $bind_host, port: ($port | tonumber), server_path: $server_path, static_dir: $static_dir, tailscale_enable: $tailscale_enable, tailscale_path: $tailscale_path, authentication: "master-password", api_mode: "limited-operations", status: "unknown"}')"
+  state_put_instance_json "$RESOLVED_INSTANCE_NAME" "$instance_json"
+}
+
+www_health_ok() {
+  curl -fsS --max-time 2 "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}/health" 2>/dev/null \
+    | jq -e '.status == "healthy" and .mode == "limited-operations"' >/dev/null 2>&1
+}
+
+www_ensure_route_available() {
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH" \
+    && ! recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    echo "Route collision: live Tailscale Serve route already exists for ${RESOLVED_TAILSCALE_PATH}." >&2
+    exit 1
+  fi
+}
+
+www_render_status() {
+  local pid="$1"
+  local observed_status="$2"
+  local route_present="no"
+  local route_match="no"
+  local url=""
+  local started_at_pretty=""
+
+  if tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    route_present="yes"
+  fi
+  if recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    route_match="yes"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    url="$(find_tailscale_url || true)"
+  fi
+  if [[ "$observed_status" == "running" ]]; then
+    started_at_pretty="$(format_started_at "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)")"
+  fi
+
+  echo "${C_BOLD}dev_stack www status${C_RESET}"
+  echo "${C_BOLD}${RESOLVED_INSTANCE_NAME}${C_RESET} $(status_dot "$observed_status") ${C_BOLD}${observed_status}${C_RESET}"
+  echo "  mode       limited-operations"
+  echo "  bind       ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  echo "  pid        ${pid:-<none>}"
+  echo "  log        ${RESOLVED_LOG_FILE}"
+  echo "  tailscale  $(format_yes_no "$RESOLVED_TAILSCALE_ENABLE")  path=${RESOLVED_TAILSCALE_PATH}"
+  echo "  route      present=${route_present}  backend_match=${route_match}"
+  echo "  access     master-password protected"
+  if [[ -n "$url" ]]; then
+    echo "  url        ${C_CYAN}${url}${C_RESET}"
+    if [[ -t 1 ]]; then
+      echo
+      python3 - "$url" <<'PY'
+import io
+import sys
+
+try:
+    import qrcode
+except ImportError:
+    print("  QR code unavailable (install the Python 'qrcode' package).")
+else:
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=1,
+    )
+    qr.add_data(sys.argv[1])
+    qr.make(fit=True)
+    output = io.StringIO()
+    qr.print_ascii(out=output, invert=True)
+    print("  scan to open")
+    print(output.getvalue().rstrip())
+PY
+    fi
+  fi
+  if [[ -n "$started_at_pretty" ]]; then
+    echo "  running    since ${started_at_pretty}"
+  fi
+}
+
+www_render_not_found() {
+  echo "${C_BOLD}dev_stack www status${C_RESET}"
+  echo "${C_BOLD}${WWW_INSTANCE_NAME}${C_RESET} $(status_dot "not_found") ${C_BOLD}not_found${C_RESET}"
+  echo "  service    ${C_DIM}not managed${C_RESET}"
+  echo "  bind       ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"
+  echo "  path       ${RESOLVED_TAILSCALE_PATH}"
+}
+
+www_reconcile_status() {
+  local recorded_pid
+  local pid_alive="false"
+  local listener_alive="false"
+  local health_ok="false"
+  local route_ok="false"
+  local observed_status="stopped"
+  local tailscale_url_json="null"
+
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    www_render_not_found
+    return
+  fi
+
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$recorded_pid"; then
+    pid_alive="true"
+  fi
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    listener_alive="true"
+  fi
+  if [[ "$listener_alive" == "true" ]] && www_health_ok; then
+    health_ok="true"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] \
+    && recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+    route_ok="true"
+    tailscale_url_json="$(jq -Rn --arg value "$(find_tailscale_url || true)" '$value')"
+  fi
+
+  if [[ "$pid_alive" == "true" && "$listener_alive" == "true" && "$health_ok" == "true" ]]; then
+    observed_status="running"
+  elif [[ "$pid_alive" == "false" && "$listener_alive" == "false" ]]; then
+    observed_status="stopped"
+  else
+    observed_status="drifted"
+  fi
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" && "$route_ok" == "false" && "$observed_status" == "running" ]]; then
+    observed_status="drifted"
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" \
+    "$observed_status" \
+    "${recorded_pid:-null}" \
+    "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$tailscale_url_json" \
+    "$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+  www_render_status "$recorded_pid" "$observed_status"
+}
+
+www_start() {
+  require_cmd python3
+  require_cmd jq
+  require_cmd ss
+  require_cmd curl
+  require_cmd setsid
+  if ! python3 "$ADMIN_AUTH_PATH" status --state-file "$ADMIN_STATE_FILE" >/dev/null 2>&1; then
+    echo "Dashboard master password is not configured." >&2
+    echo "Run: ${ADMIN_CLI} password reset" >&2
+    exit 1
+  fi
+  if [[ ! -f "$WWW_SERVER_PATH" || ! -d "$WWW_STATIC_DIR" ]]; then
+    echo "Missing www implementation under ${SCRIPT_DIR}/backend or ${SCRIPT_DIR}/frontend" >&2
+    exit 1
+  fi
+
+  local recorded_pid
+  recorded_pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if [[ "$INSTANCE_IN_STATE" == "true" ]] && process_is_alive "$recorded_pid"; then
+    echo "www is already running with pid ${recorded_pid} on ${RESOLVED_BIND_HOST}:${RESOLVED_PORT}." >&2
+    exit 1
+  fi
+  if is_port_listening "$RESOLVED_BIND_HOST" "$RESOLVED_PORT"; then
+    echo "Port ${RESOLVED_PORT} is already in use" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    www_ensure_route_available
+  fi
+  www_write_instance_definition
+  INSTANCE_IN_STATE="true"
+
+  local server_cmd=(
+    python3 "$WWW_SERVER_PATH"
+    --bind-host "$RESOLVED_BIND_HOST"
+    --port "$RESOLVED_PORT"
+    --dev-stack "${SCRIPT_DIR}/dev_stack"
+    --static-dir "$WWW_STATIC_DIR"
+    --admin-state "$ADMIN_STATE_FILE"
+    --public-path "$WWW_TAILSCALE_PATH"
+  )
+  DEV_STACK_HOME="$DEV_STACK_HOME" \
+    DEV_STACK_SETTINGS_FILE="$SETTINGS_FILE" \
+    DEV_STACK_STATE_ROOT="$STATE_ROOT" \
+    setsid nohup "${server_cmd[@]}" >"$RESOLVED_LOG_FILE" 2>&1 < /dev/null &
+  local pid=$!
+  local attempt
+  for attempt in $(seq 1 50); do
+    if process_is_alive "$pid" && www_health_ok; then
+      break
+    fi
+    sleep 0.1
+  done
+  if ! process_is_alive "$pid" || ! www_health_ok; then
+    echo "www failed to start. Check $RESOLVED_LOG_FILE" >&2
+    exit 1
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && ! configure_tailscale_route; then
+    state_merge_runtime \
+      "$RESOLVED_INSTANCE_NAME" "drifted" "$pid" "$RESOLVED_PORT" \
+      "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" "null" \
+      "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+    echo "www started locally, but Tailscale Serve configuration failed." >&2
+    exit 1
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" "running" "$pid" "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; else printf 'null'; fi)" \
+    "$(jq -Rn --arg value "$(date --iso-8601=seconds)" '$value')"
+
+  echo "www started in limited-operations mode."
+  echo "  local: http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}/"
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]]; then
+    echo "  tailscale: $(find_tailscale_url || true)"
+  else
+    echo "  tailscale: disabled"
+  fi
+  www_reconcile_status
+}
+
+www_stop() {
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "www is not managed." >&2
+    exit 1
+  fi
+
+  local pid
+  local local_stopped="true"
+  local tailscale_cleared="true"
+  local final_status="stopped"
+  pid="$(state_get_string "$RESOLVED_INSTANCE_NAME" pid)"
+  if process_is_alive "$pid"; then
+    kill -- "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+      process_is_alive "$pid" || break
+      sleep 0.1
+    done
+    if process_is_alive "$pid"; then
+      local_stopped="false"
+    fi
+  fi
+
+  if [[ "$RESOLVED_TAILSCALE_ENABLE" == "true" ]] && tailscale_route_present "$RESOLVED_TAILSCALE_PATH"; then
+    if recorded_target_matches "$RESOLVED_TAILSCALE_PATH" "http://${RESOLVED_BIND_HOST}:${RESOLVED_PORT}"; then
+      if ! remove_tailscale_route; then
+        tailscale_cleared="false"
+      fi
+    else
+      echo "Refusing to remove ${RESOLVED_TAILSCALE_PATH}: its backend is not owned by www." >&2
+      tailscale_cleared="false"
+    fi
+  fi
+  if [[ "$local_stopped" != "true" || "$tailscale_cleared" != "true" ]]; then
+    final_status="drifted"
+  fi
+
+  state_merge_runtime \
+    "$RESOLVED_INSTANCE_NAME" "$final_status" \
+    "$(if [[ "$local_stopped" == "true" ]]; then printf 'null'; else printf '%s' "$pid"; fi)" \
+    "$RESOLVED_PORT" \
+    "$(jq -Rn --arg value "$RESOLVED_LOG_FILE" '$value')" \
+    "$(if [[ "$tailscale_cleared" == "true" ]]; then printf 'null'; else jq -Rn --arg value "$(find_tailscale_url || true)" '$value'; fi)" \
+    "$(jq -Rn --arg value "$(state_get_string "$RESOLVED_INSTANCE_NAME" started_at)" '$value')"
+  www_reconcile_status
+}
+
+www_clean() {
+  if [[ "$INSTANCE_IN_STATE" != "true" ]]; then
+    echo "No stopped www service to remove from state."
+    return
+  fi
+  www_reconcile_status >/dev/null || true
+  if [[ "$(state_get_string "$RESOLVED_INSTANCE_NAME" status)" == "stopped" ]]; then
+    state_apply_jq 'del(.instances[$name])' --arg name "$RESOLVED_INSTANCE_NAME"
+    echo "Removed stopped www service from state."
+  else
+    echo "No stopped www service to remove from state."
+  fi
+}
+
+www_main() {
+  parse_www_args "$@"
+  ensure_state
+  www_resolve_config
+  case "$COMMAND" in
+    start) www_start ;;
+    stop) www_stop ;;
+    status) www_reconcile_status ;;
+    restart)
+      if [[ "$INSTANCE_IN_STATE" == "true" ]]; then
+        www_stop
+      fi
+      www_start
+      ;;
+    clean) www_clean ;;
+    *)
+      echo "Unknown command: $COMMAND" >&2
+      www_usage
+      exit 1
+      ;;
+  esac
+}
+
+parse_args() {
+  if [[ $# -lt 1 ]]; then
+    code_server_usage
+    exit 1
+  fi
+
+  case "$1" in
+    help)
+      if [[ $# -ge 2 ]]; then
+        show_command_help "$2"
+      else
+        code_server_usage
+      fi
+      exit 0
+      ;;
+    -h|--help)
+      code_server_usage
+      exit 0
+      ;;
+  esac
+
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --instance-name)
+        if [[ $# -lt 2 ]]; then
+          echo "--instance-name requires a value" >&2
+          exit 1
+        fi
+        CLI_INSTANCE_NAME="$2"
+        EXPLICIT_INSTANCE_REQUEST="true"
+        shift 2
+        ;;
+      --workspace-dir)
+        if [[ $# -lt 2 ]]; then
+          echo "--workspace-dir requires a value" >&2
+          exit 1
+        fi
+        CLI_WORKSPACE_DIR="$2"
+        shift 2
+        ;;
+      --port)
+        if [[ $# -lt 2 ]]; then
+          echo "--port requires a value" >&2
+          exit 1
+        fi
+        CLI_PORT="$2"
+        shift 2
+        ;;
+      --bind-host)
+        if [[ $# -lt 2 ]]; then
+          echo "--bind-host requires a value" >&2
+          exit 1
+        fi
+        CLI_BIND_HOST="$2"
+        shift 2
+        ;;
+      --tailscale-no-serve)
+        CLI_TAILSCALE_ENABLE="false"
+        shift
+        ;;
+      -a|--all)
+        STOP_ALL="true"
+        shift
+        ;;
+      --password-no-save)
+        CLI_PASSWORD_NO_SAVE="true"
+        shift
+        ;;
+      -h|--help|help)
+        show_command_help "$COMMAND"
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        code_server_usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+code_server_main() {
+  if [[ "${1:-}" == "profile" ]]; then
+    shift
+    code_server_profile_main "$@"
+    return
+  fi
+  parse_args "$@"
+  ensure_state
+  ensure_code_server_profiles_state
+  if [[ "$STOP_ALL" == "true" ]]; then
+    if [[ "$COMMAND" != "stop" ]]; then
+      echo "--all is only valid with stop." >&2
+      exit 1
+    fi
+    if [[ "$EXPLICIT_INSTANCE_REQUEST" == "true" ]]; then
+      echo "stop --all is mutually exclusive with --instance-name." >&2
+      exit 1
+    fi
+    stop_all_instances
+    exit 0
+  fi
+  if [[ "$COMMAND" == "status" && "$EXPLICIT_INSTANCE_REQUEST" != "true" ]]; then
+    render_status_summary
+    exit 0
+  fi
+  resolve_config
+
+  case "$COMMAND" in
+    start)
+      start_instance
+      ;;
+    stop)
+      stop_instance
+      ;;
+    status)
+      reconcile_status
+      ;;
+    restart)
+      require_explicit_instance_for_mutation
+      stop_instance
+      start_instance
+      ;;
+    clean)
+      clean_instances
+      ;;
+    *)
+      echo "Unknown command: $COMMAND" >&2
+      code_server_usage
+      exit 1
+      ;;
+  esac
+}
+
+dispatch_service_help() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 0
+  fi
+  case "$1" in
+    code-server)
+      shift
+      if [[ $# -ge 1 ]]; then
+        show_command_help "$1"
+      else
+        code_server_usage
+      fi
+      exit 0
+      ;;
+    filebrowser)
+      shift
+      filebrowser_show_command_help "${1:-}"
+      exit 0
+      ;;
+    porterminal)
+      shift
+      porterminal_show_command_help "${1:-}"
+      exit 0
+      ;;
+    go2rtc)
+      shift
+      go2rtc_show_command_help
+      exit 0
+      ;;
+    www)
+      shift
+      www_usage
+      exit 0
+      ;;
+    credentials)
+      shift
+      credentials_usage
+      exit 0
+      ;;
+    admin)
+      shift
+      admin_usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown service: $1" >&2
+      echo "Supported services: code-server, filebrowser, porterminal, go2rtc, www" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+admin_main() {
+  require_cmd python3
+  if [[ ! -f "$ADMIN_AUTH_PATH" ]]; then
+    echo "Missing admin authentication helper: $ADMIN_AUTH_PATH" >&2
+    exit 1
+  fi
+  case "${1:-}" in
+    status)
+      [[ $# -eq 1 ]] || { admin_usage; exit 1; }
+      exec python3 "$ADMIN_AUTH_PATH" status --state-file "$ADMIN_STATE_FILE"
+      ;;
+    password)
+      if [[ "${2:-}" != "reset" || $# -ne 2 ]]; then
+        admin_usage
+        exit 1
+      fi
+      exec python3 "$ADMIN_AUTH_PATH" reset --state-file "$ADMIN_STATE_FILE"
+      ;;
+    help|-h|--help|"")
+      admin_usage
+      ;;
+    *)
+      echo "Unknown admin command: $1" >&2
+      admin_usage
+      exit 1
+      ;;
+  esac
+}
+
+credentials_main() {
+  local command="${1:-}"
+  local service=""
+  local instance_name=""
+  local json_mode="false"
+  local credential_state_file=""
+  local credential_instance=""
+  local username_json="null"
+  local password=""
+
+  if [[ "$command" != "show" ]]; then
+    credentials_usage
+    exit 1
+  fi
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --service)
+        [[ $# -ge 2 ]] || { echo "--service requires a value" >&2; exit 1; }
+        service="$2"
+        shift 2
+        ;;
+      --instance-name)
+        [[ $# -ge 2 ]] || { echo "--instance-name requires a value" >&2; exit 1; }
+        instance_name="$(normalize_instance_name "$2")"
+        shift 2
+        ;;
+      --json)
+        json_mode="true"
+        shift
+        ;;
+      -h|--help|help)
+        credentials_usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown credentials option: $1" >&2
+        credentials_usage
+        exit 1
+        ;;
+    esac
+  done
+  if [[ "$json_mode" != "true" ]]; then
+    echo "Credential output requires --json." >&2
+    exit 1
+  fi
+  case "$service" in
+    code-server|filebrowser|porterminal|go2rtc)
+      require_service_enabled "$service"
+      ;;
+    *)
+      echo "Unsupported credential service: ${service:-<missing>}" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$service" in
+    code-server)
+      [[ -n "$instance_name" ]] || { echo "code-server credentials require --instance-name" >&2; exit 1; }
+      credential_state_file="${STATE_ROOT}/state-code-server.json"
+      credential_instance="$instance_name"
+      ;;
+    filebrowser)
+      [[ -z "$instance_name" ]] || { echo "filebrowser does not accept --instance-name" >&2; exit 1; }
+      credential_state_file="${STATE_ROOT}/state-filebrowser.json"
+      credential_instance="$FILEBROWSER_INSTANCE_NAME"
+      username_json='"admin"'
+      ;;
+    porterminal)
+      [[ -z "$instance_name" ]] || { echo "porterminal does not accept --instance-name" >&2; exit 1; }
+      credential_state_file="${STATE_ROOT}/state-porterminal.json"
+      credential_instance="$PORTERMINAL_INSTANCE_NAME"
+      ;;
+    go2rtc)
+      [[ -z "$instance_name" ]] || { echo "go2rtc does not accept --instance-name" >&2; exit 1; }
+      credential_state_file="${STATE_ROOT}/state-go2rtc.json"
+      credential_instance="$GO2RTC_INSTANCE_NAME"
+      username_json='"admin"'
+      ;;
+  esac
+
+  if [[ ! -f "$credential_state_file" ]]; then
+    echo "Credential state is unavailable for $service." >&2
+    exit 3
+  fi
+  if [[ "$service" == "filebrowser" || "$service" == "porterminal" || "$service" == "go2rtc" ]]; then
+    password="$(jq -r --arg name "$credential_instance" \
+      --arg service "$service" \
+      '.credentials[$service].password // .instances[$name].password // empty' \
+      "$credential_state_file")"
+  else
+    password="$(jq -r --arg name "$credential_instance" '.instances[$name].password // empty' "$credential_state_file")"
+  fi
+  if [[ -z "$password" ]]; then
+    echo "No recoverable credential is stored for ${service}${instance_name:+/$instance_name}." >&2
+    exit 3
+  fi
+
+  jq -n \
+    --arg service "$service" \
+    --arg instance "$instance_name" \
+    --arg password "$password" \
+    --argjson username "$username_json" \
+    '{service: $service, instance: (if $instance == "" then null else $instance end), username: $username, password: $password}'
+}
+
+run_all_status() {
+  local service
+  for service in code-server filebrowser porterminal go2rtc www; do
+    if service_is_enabled "$service"; then
+      echo "--${service}:"
+      "$0" "$service" status || true
+      echo "--"
+    fi
+  done
+}
+
+run_json_status() {
+  require_cmd python3
+  if [[ ! -f "$STATUS_SNAPSHOT_PATH" ]]; then
+    echo "Missing status snapshot implementation: $STATUS_SNAPSHOT_PATH" >&2
+    exit 1
+  fi
+  export DEV_STACK_STATE_ROOT="$STATE_ROOT"
+  if [[ -n "$SETTINGS_FILE" ]]; then
+    export DEV_STACK_SETTINGS_FILE="$SETTINGS_FILE"
+  fi
+  exec python3 "$STATUS_SNAPSHOT_PATH"
+}
+
+run_all_clean() {
+  local service
+  for service in code-server filebrowser porterminal go2rtc www; do
+    if service_is_enabled "$service"; then
+      echo "--${service}:"
+      "$0" "$service" clean || true
+      echo "--"
+    fi
+  done
+}
+
+main() {
+  setup_colors
+  load_settings
+
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    status)
+      if [[ $# -eq 2 && "$2" == "--json" ]]; then
+        run_json_status
+      fi
+      if [[ $# -ne 1 ]]; then
+        echo "Usage: ${SCRIPT_NAME} status [--json]" >&2
+        exit 1
+      fi
+      run_all_status
+      exit 0
+      ;;
+    clean)
+      run_all_clean
+      exit 0
+      ;;
+    help)
+      shift
+      dispatch_service_help "$@"
+      ;;
+    credentials)
+      shift
+      credentials_main "$@"
+      exit 0
+      ;;
+    admin)
+      shift
+      admin_main "$@"
+      exit 0
+      ;;
+  esac
+
+  SERVICE="$1"
+  shift
+  case "$SERVICE" in
+    code-server|filebrowser|porterminal|go2rtc|www)
+      require_service_enabled "$SERVICE"
+      ;;
+  esac
+
+  case "$SERVICE" in
+    code-server)
+      STATE_DIR="$STATE_ROOT"
+      STATE_FILE="${STATE_DIR}/state-code-server.json"
+      code_server_main "$@"
+      ;;
+    filebrowser)
+      STATE_DIR="$STATE_ROOT"
+      STATE_FILE="${STATE_DIR}/state-filebrowser.json"
+      filebrowser_main "$@"
+      ;;
+    porterminal)
+      STATE_DIR="$STATE_ROOT"
+      STATE_FILE="${STATE_DIR}/state-porterminal.json"
+      porterminal_main "$@"
+      ;;
+    go2rtc)
+      STATE_DIR="$STATE_ROOT"
+      STATE_FILE="${STATE_DIR}/state-go2rtc.json"
+      go2rtc_main "$@"
+      ;;
+    www)
+      STATE_DIR="$STATE_ROOT"
+      STATE_FILE="${STATE_DIR}/state-www.json"
+      www_main "$@"
+      ;;
+    *)
+      echo "Unknown service: $SERVICE" >&2
+      echo "Supported services: code-server, filebrowser, porterminal, go2rtc, www" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

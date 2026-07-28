@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#f3f6f2" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#111713" media="(prefers-color-scheme: dark)">
+    <meta name="description" content="A private status and limited-operations dashboard for dev_stack services.">
+    <title>Dev Stack Status</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23147a4b'/%3E%3Cpath d='M16 42V30M32 42V16M48 42V24' stroke='white' stroke-width='7' stroke-linecap='round'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./qrcode.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#services">Skip to service status</a>
+
+    <header class="topbar">
+      <div class="page-shell topbar__inner">
+        <a class="brand" href="./" aria-label="Dev Stack status home">
+          <span class="brand__mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </span>
+          <span class="brand__name">dev_stack</span>
+        </a>
+
+        <div class="topbar__actions">
+          <div class="host-menu" id="host-menu">
+            <button
+              class="topbar-host connection-pill--checking"
+              id="connection-pill"
+              type="button"
+              aria-expanded="false"
+              aria-controls="host-menu-panel"
+              aria-haspopup="true"
+            >
+              <span class="connection-pill__dot" aria-hidden="true"></span>
+              <span class="topbar-host__fact topbar-host__fact--hostname">
+                <span class="topbar-host__label">Host</span>
+                <strong id="host-name">—</strong>
+              </span>
+              <span class="topbar-host__divider" aria-hidden="true"></span>
+              <span class="topbar-host__fact topbar-host__fact--ip">
+                <span class="topbar-host__label">Tailscale IP</span>
+                <strong id="tailnet-address">—</strong>
+              </span>
+              <svg class="topbar-host__chevron" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m4 6 4 4 4-4"></path>
+              </svg>
+              <span class="visually-hidden" id="connection-label" role="status" aria-live="polite">
+                Checking tailnet
+              </span>
+            </button>
+
+            <div class="host-menu__panel" id="host-menu-panel" hidden>
+              <div class="host-menu__header">
+                <strong>Host details</strong>
+                <span>Private network</span>
+              </div>
+              <div class="host-menu__content">
+                <section class="host-detail-section" aria-labelledby="identity-title">
+                  <div class="host-detail-section__heading">
+                    <h3 id="identity-title">Identity</h3>
+                    <span>Tailnet</span>
+                  </div>
+                  <dl class="host-detail-list">
+                    <div class="host-detail-row">
+                      <dt>Username</dt>
+                      <dd id="detail-username">—</dd>
+                    </div>
+                    <div class="host-detail-row">
+                      <dt>Hostname</dt>
+                      <dd id="detail-hostname">—</dd>
+                    </div>
+                    <div class="host-detail-row">
+                      <dt>MagicDNS</dt>
+                      <dd id="detail-magicdns">—</dd>
+                    </div>
+                    <div class="host-detail-row">
+                      <dt>Tailscale IP</dt>
+                      <dd id="detail-tailnet-ip">—</dd>
+                    </div>
+                    <div class="host-detail-row">
+                      <dt>SSH</dt>
+                      <dd class="host-ssh-command">
+                        <code id="ssh-command">—</code>
+                        <button class="host-copy-button" id="ssh-copy-button" type="button" aria-label="Copy SSH command" title="Copy SSH command">
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+                            <path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"></path>
+                          </svg>
+                        </button>
+                      </dd>
+                    </div>
+                  </dl>
+                </section>
+
+                <section class="host-detail-section" aria-labelledby="interfaces-title">
+                  <div class="host-detail-section__heading">
+                    <h3 id="interfaces-title">Physical interfaces</h3>
+                    <span id="interface-count">—</span>
+                  </div>
+                  <div class="host-interface-list" id="host-interface-list"></div>
+                </section>
+
+                <section class="host-detail-section" aria-labelledby="services-title">
+                  <div class="host-detail-section__heading">
+                    <h3 id="services-title">Service health</h3>
+                    <span>Managed tools</span>
+                  </div>
+                  <div class="host-menu__counts" aria-label="Service counts">
+                    <span class="status-count status-count--running"><strong id="running-count">—</strong> running</span>
+                    <span class="status-count status-count--attention"><strong id="attention-count">—</strong> attention</span>
+                    <span class="status-count status-count--stopped"><strong id="stopped-count">—</strong> stopped</span>
+                  </div>
+                </section>
+
+                <section class="host-detail-section host-detail-section--qr" aria-labelledby="phone-title">
+                  <div class="host-qr__copy">
+                    <div class="host-detail-section__heading">
+                      <h3 id="phone-title">Open on phone</h3>
+                    </div>
+                    <p>Scan from a device connected to this tailnet.</p>
+                    <a class="host-qr__link" id="host-qr-link" href="#" target="_blank" rel="noopener noreferrer">
+                      <span id="host-qr-url">Dashboard URL</span>
+                      <span aria-hidden="true">↗</span>
+                    </a>
+                  </div>
+                  <div class="host-qr" id="host-qr" role="img" aria-label="QR code for this private dashboard"></div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <time class="topbar-updated" id="generated-at">—</time>
+          <span class="visually-hidden" id="refresh-status" role="status" aria-live="polite">
+            Waiting for status…
+          </span>
+
+          <button class="logout-button" id="logout-button" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M12 2v10M6.35 5.35a8 8 0 1 0 11.3 0" />
+            </svg>
+            <span>Sign out</span>
+          </button>
+
+          <button class="refresh-button refresh-button--compact" id="refresh-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 6v5h-5M4 18v-5h5"></path>
+              <path d="M6.1 9A7 7 0 0 1 18.5 6.5L20 8M4 16l1.5 1.5A7 7 0 0 0 17.9 15"></path>
+            </svg>
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-shell page-main">
+      <div class="notice-region" id="notice-region" aria-live="polite"></div>
+
+      <section class="services-section" id="services" aria-label="Managed service status">
+        <div class="service-grid" id="service-grid" aria-busy="true">
+          <article class="service-card service-card--skeleton" aria-hidden="true"></article>
+          <article class="service-card service-card--skeleton" aria-hidden="true"></article>
+          <article class="service-card service-card--skeleton" aria-hidden="true"></article>
+        </div>
+      </section>
+    </main>
+
+    <dialog class="credential-dialog" id="credential-dialog" aria-labelledby="credential-dialog-title">
+      <div class="credential-dialog__header">
+        <div>
+          <p class="credential-dialog__eyebrow">Protected credential</p>
+          <h2 id="credential-dialog-title">Service password</h2>
+        </div>
+        <button class="icon-button" id="credential-close" type="button" aria-label="Close credential dialog">×</button>
+      </div>
+
+      <div id="credential-content">
+        <p class="credential-dialog__target" id="credential-target"></p>
+        <div class="credential-field" id="credential-username-row" hidden>
+          <span>Username</span>
+          <code id="credential-username"></code>
+        </div>
+        <label class="credential-field credential-field--password">
+          <span>Password</span>
+          <input id="credential-password" type="text" readonly autocomplete="off" spellcheck="false">
+        </label>
+        <p class="credential-dialog__hint" id="credential-expiry">The password will clear automatically.</p>
+        <div class="credential-dialog__actions">
+          <button class="credential-button credential-button--primary" id="credential-copy" type="button">Copy password</button>
+          <button class="credential-button" id="credential-hide" type="button">Hide</button>
+        </div>
+      </div>
+
+      <div class="credential-dialog__loading" id="credential-loading" hidden>Requesting protected credential…</div>
+    </dialog>
+
+    <dialog class="workspace-dialog" id="workspace-dialog" aria-labelledby="workspace-dialog-title">
+      <form class="workspace-dialog__form" id="workspace-form">
+        <div class="credential-dialog__header">
+          <div>
+            <p class="credential-dialog__eyebrow">Code Server</p>
+            <h2 id="workspace-dialog-title">Start workspace</h2>
+          </div>
+          <button class="icon-button" id="workspace-close" type="button" aria-label="Close start workspace dialog">×</button>
+        </div>
+        <div class="workspace-dialog__content">
+          <label class="credential-field">
+            <span>Instance name</span>
+            <input id="workspace-instance" name="instance" type="text" required pattern="[a-z0-9-]+" maxlength="80" autocomplete="off" placeholder="my-workspace">
+          </label>
+          <label class="credential-field">
+            <span>Full workspace path</span>
+            <input id="workspace-path" name="workspace" type="text" required maxlength="4096" autocomplete="off" spellcheck="false" placeholder="/home/user/workspace">
+          </label>
+          <p class="credential-dialog__hint">The path must be an existing absolute directory on this host.</p>
+          <div class="credential-dialog__actions">
+            <button class="credential-button" id="workspace-cancel" type="button">Cancel</button>
+            <button class="credential-button credential-button--primary" type="submit">Start</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <footer class="page-footer">
+      <div class="page-shell page-footer__inner">
+        <p>Private status surface · limited lifecycle controls</p>
+        <p id="endpoint-label">Endpoint: <code>./api/status</code></p>
+      </div>
+    </footer>
+
+    <noscript>
+      <div class="noscript-message">
+        JavaScript is required to load dev_stack status.
+      </div>
+    </noscript>
+  </body>
+</html>
