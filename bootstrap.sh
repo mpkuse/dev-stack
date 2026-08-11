@@ -59,7 +59,7 @@ Steps:
 
 Requires sudo for steps 1-4. Two steps are interactive: Tailscale prints a URL
 to authenticate the machine, and the master password is typed without echo.
-Step 6 is skipped automatically when stdin is not a terminal.
+Step 7 is skipped automatically when stdin is not a terminal.
 
 No service is started; nothing is configured to start at boot.
 EOF
