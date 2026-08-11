@@ -220,7 +220,19 @@ if [[ "${RUN_INIT}" == "false" ]]; then
 fi
 
 step "6/7  Installing the checkout"
-"${REPOSITORY_ROOT}/init.sh" --prefix "${PREFIX}"
+# init.sh exit 2 means the files installed but a mandatory check failed, most
+# often Tailscale not being up. The install itself is sound, so carry on to the
+# password step rather than aborting and silently skipping it, and report the
+# unready state at the end.
+init_status=0
+"${REPOSITORY_ROOT}/init.sh" --prefix "${PREFIX}" || init_status=$?
+if (( init_status == 2 )); then
+  echo
+  echo "init.sh reports the install is not ready yet (exit 2)." >&2
+  echo "Continuing; the summary below repeats what is outstanding." >&2
+elif (( init_status != 0 )); then
+  exit "${init_status}"
+fi
 
 # The dashboard refuses to start until a master password exists. The prompt
 # reads from a terminal with echo off, so it can only run interactively; a
@@ -270,3 +282,11 @@ Two things worth knowing:
   - If you were just added to the docker group, log out and back in (or run
     'newgrp docker') before Docker works without sudo.
 EOF
+
+if (( init_status != 0 )); then
+  echo
+  echo "Note: init.sh exited ${init_status}. dev-stack is installed, but at least one" >&2
+  echo "mandatory check is still failing. Re-run to recheck:" >&2
+  echo "  ${REPOSITORY_ROOT}/init.sh --check --prefix ${PREFIX}" >&2
+  exit "${init_status}"
+fi
