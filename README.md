@@ -51,6 +51,15 @@ own, in the order above.
 
 Requires `sudo` for steps 1-4. Steps 2 and 7 need a terminal.
 
+Step 5 appends to `~/.bashrc` and `~/.profile`. It is the only step that edits
+files outside the prefix, it is guarded so a second run does not append twice,
+and `--skip-shell-env` opts out.
+
+`bootstrap.sh` exits 0 when everything passed, and `2` when the install
+completed but `init.sh` still reports a failing mandatory check — usually
+Tailscale not being up. Exit `2` is not a failed install: the remaining steps
+still run, and the closing note repeats what is outstanding.
+
 ### Nuances worth knowing
 
 **The Tailscale operator grant is invisible when missing.** dev-stack writes
