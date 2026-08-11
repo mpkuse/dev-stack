@@ -43,6 +43,35 @@ readonly SUPPORTING_PACKAGES=(
   python3-qrcode
 )
 
+usage() {
+  cat <<'USAGE'
+Usage: ./install_prerequisites.sh
+
+Installs the baseline dev-stack expects on an Ubuntu 24.04 host: the mandatory
+apt runtime dependencies, git, zellij, Docker Engine and the Compose plugin
+with docker-group access, and python3-qrcode.
+
+Takes no options; it installs unconditionally and is safe to re-run. Pins are
+overridden through the environment instead:
+  ZELLIJ_VERSION   zellij release to install
+
+Requires sudo. Tailscale is handled by install_tailscale.sh.
+USAGE
+}
+
+# This script installs as its only action, so an unrecognised argument must not
+# be ignored: a typo would otherwise silently start a full install.
+if (( $# > 0 )); then
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Error: this script takes no options: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ ! -r /etc/os-release ]]; then
   echo "Error: cannot identify the operating system." >&2
   exit 1

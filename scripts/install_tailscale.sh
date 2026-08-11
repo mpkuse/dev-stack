@@ -7,6 +7,31 @@ readonly REPO_URL="https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyr
 readonly KEY_PATH="/usr/share/keyrings/tailscale-archive-keyring.gpg"
 readonly REPO_PATH="/etc/apt/sources.list.d/tailscale.list"
 
+usage() {
+  cat <<'USAGE'
+Usage: ./install_tailscale.sh
+
+Installs Tailscale from its official repository on Ubuntu 24.04, enables
+tailscaled, and runs 'tailscale up' to authenticate this machine.
+
+Takes no options. Interactive: 'tailscale up' prints a URL to visit.
+Requires sudo.
+USAGE
+}
+
+# Installing and authenticating is this script's only action, so do not ignore
+# an unrecognised argument.
+if (( $# > 0 )); then
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Error: this script takes no options: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ ! -r /etc/os-release ]]; then
   echo "Error: cannot identify the operating system." >&2
   exit 1
