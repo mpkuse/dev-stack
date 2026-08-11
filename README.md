@@ -20,35 +20,82 @@ used. It is not configured to start at boot.
 ## Setting up a fresh machine
 
 On a brand-new Ubuntu 24.04 (Noble) host, `bootstrap.sh` installs everything
-dev-stack needs and then installs the checkout:
+dev-stack needs and then installs the checkout. Ubuntu 24.04 ships without
+`git`, so install it before cloning:
 
 ```bash
+sudo apt-get update && sudo apt-get install --yes git
 git clone https://github.com/mpkuse/dev-stack.git
 cd dev-stack
 ./bootstrap.sh
 ```
 
-It runs the installers in `scripts/` in dependency order, then hands off to
-`init.sh`:
+`bootstrap.sh` runs the installers in `scripts/` in dependency order, then hands
+off to `init.sh`:
 
-| Step | Script | Installs |
+| Step | Action | Detail |
 | --- | --- | --- |
 | 1 | `scripts/install_prerequisites.sh` | apt runtime dependencies, `git`, `zellij`, Docker Engine + Compose, `python3-qrcode` |
-| 2 | `scripts/install_tailscale.sh` | Tailscale, when it is not already up. Interactive: prints a URL to authenticate |
-| 3 | — | `tailscale set --operator`, when no operator is recorded |
+| 2 | `scripts/install_tailscale.sh` | only when Tailscale is not already up. **Interactive**: prints a URL to authenticate the machine |
+| 3 | `tailscale set --operator` | only when no operator is recorded |
 | 4 | `scripts/install_dev_stack_tools.sh` | code-server, File Browser, Porterminal |
-| 5 | `./init.sh` | the checkout itself, plus the readiness report |
+| 5 | shell environment | `PATH` and `DEV_STACK_PORTERMINAL_COMMAND` in `~/.bashrc` and `~/.profile` |
+| 6 | `./init.sh --prefix PATH` | the checkout itself, plus the readiness report |
+| 7 | `dev_stack admin password reset` | only when no master password is set. **Interactive**, and skipped when stdin is not a terminal |
 
 Every step is idempotent, so re-running on a configured host changes nothing.
-Individual steps can be skipped with `--skip-prerequisites`, `--skip-tailscale`,
-`--skip-tools` and `--no-init`; `--prefix` is passed through to `init.sh`. The
-scripts can also be run on their own, in the order above.
+Steps can be skipped with `--skip-prerequisites`, `--skip-tailscale`,
+`--skip-tools`, `--skip-shell-env`, `--no-init` and `--skip-admin-password`;
+`--prefix` is passed through to `init.sh`. Each script can also be run on its
+own, in the order above.
 
-Step 3 is easy to miss and worth calling out: dev-stack writes Tailscale Serve
-config every time a service starts, which requires operator rights. Reading
-Serve status succeeds without them, so a host missing the operator grant looks
+Requires `sudo` for steps 1-4. Steps 2 and 7 need a terminal.
+
+### Nuances worth knowing
+
+**The Tailscale operator grant is invisible when missing.** dev-stack writes
+Serve config every time a service starts, which requires operator rights.
+*Reading* Serve status succeeds without them, so a host missing the grant looks
 healthy to `init.sh --check` while every service start fails to publish its
-route.
+route with `Access denied: serve config denied`. Step 3 handles it; the recorded
+operator is read from `tailscale debug prefs`, since probing Serve cannot detect
+this.
+
+**Porterminal is found as a bare command on `PATH`.** It installs to
+`~/.local/bin`, which Ubuntu adds to `PATH` only from `~/.profile` — so an
+interactive non-login shell never sees it and `porterminal start` fails with
+`Missing Porterminal command`. Step 5 writes an absolute
+`DEV_STACK_PORTERMINAL_COMMAND` into both `~/.bashrc` and `~/.profile` to make
+this PATH-independent. Shells already open when bootstrap ran need to be
+reloaded, and `dev_stack www` needs a restart to inherit it, because the
+dashboard passes its own environment to the lifecycle actions it invokes.
+
+**Porterminal's first launch is slow.** It runs through `uv` from a checkout, and
+a cold cache resolves and builds around 40 packages — long enough that
+`dev_stack porterminal start` times out waiting for the port and leaves an
+unmanaged process holding it. Step 4 warms the environment with `uv sync` to
+avoid that.
+
+**Docker group membership needs a new login.** `usermod` never changes an
+already-running session, so `docker` stays unreachable without `sudo` until you
+log out and back in, or run `newgrp docker`.
+
+**No service starts, and nothing survives a reboot.** `bootstrap.sh` installs and
+configures only. Start services yourself, and expect to start them again after
+a reboot; there are no systemd units.
+
+**A fresh install enables every service, including go2rtc**, whose host paths in
+`init.sh` are defaults that will not match a new machine. `init.sh --check`
+reports them as missing until they are corrected in
+`<prefix>/.dev-stack/config/settings.json`, or the service is disabled with
+`./init.sh --no-go2rtc`. These paths are written only on a *fresh* install, so
+re-enabling later does not re-prompt for them.
+
+**`init.sh` does not upgrade.** After a `git pull`, the checkout and the
+installed copy differ and `init.sh` refuses with `the source and installed code
+differ`. Change service flags *before* pulling, or reinstall by removing only
+the code directory and command symlink it names — the runtime tree, with its
+credentials and state, is separate and is never touched.
 
 ## Installation
 

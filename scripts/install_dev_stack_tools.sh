@@ -292,4 +292,4 @@ fi
 
 echo
 echo "Selected tools are installed."
-echo "Recheck dev-stack with: ~/workspace/dev-stack/init.sh --check --prefix ~/.bin"
+echo "Recheck dev-stack from the checkout with: ./init.sh --check [--prefix PATH]"

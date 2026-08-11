@@ -163,7 +163,14 @@ install_docker_packages() {
     containerd.io \
     docker-buildx-plugin \
     docker-compose-plugin
-  sudo systemctl enable --now docker
+  # Guard on systemd being the init system: the packages install fine inside a
+  # container, where systemctl has nothing to talk to.
+  if [[ -d /run/systemd/system ]]; then
+    sudo systemctl enable --now docker
+  else
+    echo "systemd is not the init system; skipping 'systemctl enable --now docker'."
+    echo "Start the daemon yourself in this environment."
+  fi
 }
 
 # Group membership is handled separately from package installation so that a

@@ -28,6 +28,7 @@ RUN_PREREQUISITES="true"
 RUN_TAILSCALE="true"
 RUN_TOOLS="true"
 RUN_INIT="true"
+RUN_SHELL_ENV="true"
 RUN_ADMIN_PASSWORD="true"
 
 usage() {
@@ -42,6 +43,7 @@ Options:
   --skip-tailscale       Do not install or configure Tailscale
   --skip-tools           Do not run scripts/install_dev_stack_tools.sh
   --no-init              Stop before running ./init.sh
+  --skip-shell-env       Do not touch ~/.bashrc or ~/.profile
   --skip-admin-password  Do not prompt for the dashboard master password
   -h, --help             Show this help
 
@@ -50,8 +52,10 @@ Steps:
   2. scripts/install_tailscale.sh       only when Tailscale is not yet up
   3. tailscale set --operator           only when no operator is recorded
   4. scripts/install_dev_stack_tools.sh code-server, filebrowser, porterminal
-  5. ./init.sh --prefix PATH            install the checkout and report readiness
-  6. dev_stack admin password reset     only when no master password is set
+  5. shell environment                  PATH and DEV_STACK_PORTERMINAL_COMMAND in
+                                        ~/.bashrc and ~/.profile
+  6. ./init.sh --prefix PATH            install the checkout and report readiness
+  7. dev_stack admin password reset     only when no master password is set
 
 Requires sudo for steps 1-4. Two steps are interactive: Tailscale prints a URL
 to authenticate the machine, and the master password is typed without echo.
@@ -77,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --skip-tailscale) RUN_TAILSCALE="false"; shift ;;
     --skip-tools) RUN_TOOLS="false"; shift ;;
     --no-init) RUN_INIT="false"; shift ;;
+    --skip-shell-env) RUN_SHELL_ENV="false"; shift ;;
     --skip-admin-password) RUN_ADMIN_PASSWORD="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -104,28 +109,77 @@ tailscale_is_up() {
   command -v tailscale >/dev/null 2>&1 && tailscale status --json >/dev/null 2>&1
 }
 
+# dev_stack resolves Porterminal as a bare command on PATH, and the www dashboard
+# inherits the PATH that started it. ~/.local/bin is added only by ~/.profile, so
+# an interactive non-login shell never sees it and 'porterminal start' fails with
+# "Missing Porterminal command". Warning about it is not enough: a fresh box would
+# hit that on the first start, so write the fix into both rc files.
+#   ~/.bashrc  interactive shells, login or not
+#   ~/.profile login shells, including 'bash -lc'
+configure_shell_environment() {
+  local rc_file
+  local wrote_any="false"
+
+  for rc_file in "${HOME}/.bashrc" "${HOME}/.profile"; do
+    [[ -f "${rc_file}" ]] || continue
+    if grep --quiet 'DEV_STACK_PORTERMINAL_COMMAND' "${rc_file}"; then
+      echo "already configured: ${rc_file}"
+      continue
+    fi
+    cat >> "${rc_file}" <<EOF
+
+# dev-stack: resolve dev_stack and porterminal regardless of shell type.
+export DEV_STACK_PORTERMINAL_COMMAND="\${HOME}/.local/bin/porterminal"
+case ":\${PATH}:" in
+    *":${PREFIX}:"*) ;;
+    *) PATH="${PREFIX}:\${PATH}" ;;
+esac
+case ":\${PATH}:" in
+    *":\${HOME}/.local/bin:"*) ;;
+    *) PATH="\${HOME}/.local/bin:\${PATH}" ;;
+esac
+EOF
+    echo "updated: ${rc_file}"
+    wrote_any="true"
+  done
+
+  if [[ "${wrote_any}" == "true" ]]; then
+    echo
+    echo "New shells pick this up automatically. This bootstrap run exports it"
+    echo "itself so the remaining steps and any service it starts inherit it."
+  fi
+
+  # Apply to this run too, so step 6's init.sh sees porterminal on PATH.
+  export DEV_STACK_PORTERMINAL_COMMAND="${HOME}/.local/bin/porterminal"
+  case ":${PATH}:" in
+    *":${HOME}/.local/bin:"*) ;;
+    *) PATH="${HOME}/.local/bin:${PATH}" ;;
+  esac
+  export PATH
+}
+
 if [[ "${RUN_PREREQUISITES}" == "true" ]]; then
-  step "1/6  Prerequisites"
+  step "1/7  Prerequisites"
   # A missing Tailscale is reported as [todo] rather than a failure, so this
   # succeeds on a fresh box and any non-zero exit is a genuine problem.
   "${SCRIPTS_DIR}/install_prerequisites.sh"
 else
-  step "1/6  Prerequisites (skipped)"
+  step "1/7  Prerequisites (skipped)"
 fi
 
 if [[ "${RUN_TAILSCALE}" == "true" ]]; then
   if tailscale_is_up; then
-    step "2/6  Tailscale (already up, skipping install)"
+    step "2/7  Tailscale (already up, skipping install)"
     tailscale status | head -3 || true
   else
-    step "2/6  Tailscale (interactive: authenticate at the printed URL)"
+    step "2/7  Tailscale (interactive: authenticate at the printed URL)"
     "${SCRIPTS_DIR}/install_tailscale.sh"
   fi
 
   # dev-stack writes Serve config on every service start, which needs operator
   # rights. Reading serve status succeeds without them, so this is checked
   # against prefs rather than by probing.
-  step "3/6  Tailscale operator"
+  step "3/7  Tailscale operator"
   if tailscale_is_up; then
     account="$(id --user --name)"
     operator_user="$(tailscale debug prefs 2>/dev/null | jq -r '.OperatorUser // ""')"
@@ -139,32 +193,39 @@ if [[ "${RUN_TAILSCALE}" == "true" ]]; then
     echo "Tailscale is not up; skipping the operator grant." >&2
   fi
 else
-  step "2/6  Tailscale (skipped)"
-  step "3/6  Tailscale operator (skipped)"
+  step "2/7  Tailscale (skipped)"
+  step "3/7  Tailscale operator (skipped)"
 fi
 
 if [[ "${RUN_TOOLS}" == "true" ]]; then
-  step "4/6  dev-stack service tools"
+  step "4/7  dev-stack service tools"
   "${SCRIPTS_DIR}/install_dev_stack_tools.sh"
 else
-  step "4/6  dev-stack service tools (skipped)"
+  step "4/7  dev-stack service tools (skipped)"
+fi
+
+if [[ "${RUN_SHELL_ENV}" == "true" ]]; then
+  step "5/7  Shell environment"
+  configure_shell_environment
+else
+  step "5/7  Shell environment (skipped)"
 fi
 
 if [[ "${RUN_INIT}" == "false" ]]; then
-  step "5/6  init.sh (skipped)"
+  step "6/7  init.sh (skipped)"
   echo
   echo "Bootstrap stopped before install. Run it yourself with:"
   echo "  ${REPOSITORY_ROOT}/init.sh --prefix ${PREFIX}"
   exit 0
 fi
 
-step "5/6  Installing the checkout"
+step "6/7  Installing the checkout"
 "${REPOSITORY_ROOT}/init.sh" --prefix "${PREFIX}"
 
 # The dashboard refuses to start until a master password exists. The prompt
 # reads from a terminal with echo off, so it can only run interactively; a
 # piped or cron-driven bootstrap gets the instruction instead of a hang.
-step "6/6  Dashboard master password"
+step "7/7  Dashboard master password"
 if [[ "${RUN_ADMIN_PASSWORD}" != "true" ]]; then
   echo "Skipped. Set it before starting the dashboard:"
   echo "  ${PREFIX}/dev_stack admin password reset"
