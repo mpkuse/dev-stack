@@ -17,11 +17,45 @@ The default local port is **1080**. The server binds to loopback and is publishe
 privately at `/dev-stack` with Tailscale Serve unless `--tailscale-no-serve` is
 used. It is not configured to start at boot.
 
+## Setting up a fresh machine
+
+On a brand-new Ubuntu 24.04 (Noble) host, `bootstrap.sh` installs everything
+dev-stack needs and then installs the checkout:
+
+```bash
+git clone https://github.com/mpkuse/dev-stack.git
+cd dev-stack
+./bootstrap.sh
+```
+
+It runs the installers in `scripts/` in dependency order, then hands off to
+`init.sh`:
+
+| Step | Script | Installs |
+| --- | --- | --- |
+| 1 | `scripts/install_prerequisites.sh` | apt runtime dependencies, `git`, `zellij`, Docker Engine + Compose, `python3-qrcode` |
+| 2 | `scripts/install_tailscale.sh` | Tailscale, when it is not already up. Interactive: prints a URL to authenticate |
+| 3 | — | `tailscale set --operator`, when no operator is recorded |
+| 4 | `scripts/install_dev_stack_tools.sh` | code-server, File Browser, Porterminal |
+| 5 | `./init.sh` | the checkout itself, plus the readiness report |
+
+Every step is idempotent, so re-running on a configured host changes nothing.
+Individual steps can be skipped with `--skip-prerequisites`, `--skip-tailscale`,
+`--skip-tools` and `--no-init`; `--prefix` is passed through to `init.sh`. The
+scripts can also be run on their own, in the order above.
+
+Step 3 is easy to miss and worth calling out: dev-stack writes Tailscale Serve
+config every time a service starts, which requires operator rights. Reading
+Serve status succeeds without them, so a host missing the operator grant looks
+healthy to `init.sh --check` while every service start fails to publish its
+route.
+
 ## Installation
 
 `init.sh` installs the current checkout; it never clones a repository, downloads
 software, installs packages, or starts or stops a service. The checkout can live
-anywhere, including `~/Downloads`.
+anywhere, including `~/Downloads`. Installing software is `bootstrap.sh`'s job,
+never `init.sh`'s.
 
 On a machine where the old `~/.bin/dev_stack` still exists, preserve it with the
 one-off manual rename first:
