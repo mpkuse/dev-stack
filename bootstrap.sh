@@ -273,20 +273,25 @@ Then check everything with:
 
 Two things worth knowing:
 
-  - Porterminal is found as a bare 'porterminal' command on PATH, and the www
-    dashboard inherits the PATH that started it. ~/.local/bin is added only by
-    ~/.profile, so a non-login shell cannot see it. Export the absolute path in
-    both ~/.bashrc and ~/.profile:
-      export DEV_STACK_PORTERMINAL_COMMAND="\$HOME/.local/bin/porterminal"
+  - Step 5 wrote PATH and DEV_STACK_PORTERMINAL_COMMAND into ~/.bashrc and
+    ~/.profile, so Porterminal resolves in any new shell. Shells that were
+    already open need reloading, and 'dev_stack www' must be restarted to
+    inherit it, because the dashboard hands its own environment to the
+    lifecycle actions it runs.
 
   - If you were just added to the docker group, log out and back in (or run
     'newgrp docker') before Docker works without sudo.
 EOF
 
+# Deliberately on stdout: mixing this into stderr lets it interleave ahead of
+# the banner above whenever both streams are captured together.
 if (( init_status != 0 )); then
-  echo
-  echo "Note: init.sh exited ${init_status}. dev-stack is installed, but at least one" >&2
-  echo "mandatory check is still failing. Re-run to recheck:" >&2
-  echo "  ${REPOSITORY_ROOT}/init.sh --check --prefix ${PREFIX}" >&2
+  cat <<EOF
+
+Note: init.sh exited ${init_status}. dev-stack is installed, but at least one
+mandatory check is still failing. Recheck with:
+
+  ${REPOSITORY_ROOT}/init.sh --check --prefix ${PREFIX}
+EOF
   exit "${init_status}"
 fi
